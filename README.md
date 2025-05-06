@@ -24,5 +24,5 @@
 
 ## 💡 Proč tento projekt?
 
-Jako člověk, který je často ve styku s hudbou – ale nenašel jsem vyhovující jednoduchý offline nástroj, který by mi umožnil úpravy, které bych chtěl. Cílem prozatím "PracticeMasteru" je nabídnout rychlý a spolehlivý způsob, jak si „rozebrat“ skladbu na části a efektivně je procvičovat bez rušivých prvků a složitostí.
+Jako člověk, který je často ve styku s hudbou jsem nenašel vyhovující jednoduchý offline nástroj, který by mi umožnil úpravy, které bych chtěl. Cílem prozatím "PracticeMasteru" je nabídnout rychlý a spolehlivý způsob, jak si „rozebrat“ skladbu na části a efektivně je procvičovat bez rušivých prvků a složitostí.
 
