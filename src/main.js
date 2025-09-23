@@ -16,7 +16,7 @@ const createWindow = () => {
     win.loadURL("http://localhost:5173");
   } else {
     // V produkci načítáme build z Vite
-    win.loadFile(path.join(__dirname, "dist", "index.html"));
+    win.loadFile(path.join(__dirname, "index.html"));
   }
 
   // Volitelně - pro ladění v režimu vývoje
