@@ -1,189 +1,101 @@
-from PyQt6.QtCore import QObject, pyqtSignal, QTimer
-import os, tempfile, threading, time
-from typing import Optional
+from __future__ import annotations
 
-import numpy as np
-import sounddevice as sd
-import soundfile as sf
-from pydub import AudioSegment  # pro dekódování MP3/FLAC → WAV
+from typing import Optional
+from PyQt6.QtCore import QObject, QUrl, QTimer, pyqtSignal
+from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 
 
 class AudioPlayer(QObject):
-    position_changed = pyqtSignal(int)   # ms
-    duration_changed = pyqtSignal(int)   # ms
+    position_changed = pyqtSignal(int)   # ms (render time)
+    duration_changed = pyqtSignal(int)   # ms (render time)
+    media_loaded = pyqtSignal()          # emitne se, když je médium načtené (LoadedMedia)
 
-    def __init__(self):
-        super().__init__()
-        self.current_source: Optional[str] = None
+    def __init__(self, parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self._player = QMediaPlayer()
+        self._audio_out = QAudioOutput()
+        self._player.setAudioOutput(self._audio_out)
 
-        # dočasný WAV (dekódovaný zdroj nebo tempo-varianta)
-        self._tmp_wav: Optional[str] = None
-        self._sf: Optional[sf.SoundFile] = None
+        # volume default 100 %
+        self.set_volume(100)
 
-        # stream
-        self._stream: Optional[sd.OutputStream] = None
-        self._lock = threading.Lock()
+        self._player.positionChanged.connect(lambda ms: self.position_changed.emit(int(ms)))
+        self._player.durationChanged.connect(lambda ms: self.duration_changed.emit(int(ms)))
+        self._player.mediaStatusChanged.connect(self._on_media_status)
 
-        # stav
-        self._samplerate = 0
-        self._channels = 2
-        self._frames_total = 0
-        self._frame_pos = 0
-        self._playing = False
+        # loop (render-time ms)
+        self._loop_a: Optional[int] = None
+        self._loop_b: Optional[int] = None
 
-        # loop
-        self._loop_a: Optional[int] = None  # v ms
-        self._loop_b: Optional[int] = None  # v ms
-
-        # UI ticker
-        self._timer = QTimer(self)
-        self._timer.setInterval(50)
-        self._timer.timeout.connect(self._on_tick)
+        self._loop_timer = QTimer(self)
+        self._loop_timer.setInterval(15)
+        self._loop_timer.timeout.connect(self._tick_loop)
+        self._loop_timer.start()
 
     # ---------- public API ----------
-
     def load(self, path: str, autostart: bool = False):
-        """Načti libovolné audio (mp3/wav/flac). Převod do dočasného WAV a otevření pro stream."""
-        self.stop()
-        self.current_source = path
-
-        # Dekódování přes pydub (ffmpeg) → WAV
-        audio = AudioSegment.from_file(path)
-        self._tmp_wav = os.path.join(
-            tempfile.gettempdir(),
-            os.path.splitext(os.path.basename(path))[0] + ".pm_tmp.wav"
-        )
-        audio.export(self._tmp_wav, format="wav")
-
-        # Otevři WAV přes soundfile
-        self._sf = sf.SoundFile(self._tmp_wav, mode="r")
-        self._samplerate = int(self._sf.samplerate)
-        self._channels = int(self._sf.channels)
-        self._frames_total = len(self._sf)
-        self._frame_pos = 0
-
-        self.duration_changed.emit(self._frames_to_ms(self._frames_total))
-
+        # Nastavíme zdroj a případné autostart řeší nadřízený kód po media_loaded
+        self._player.setSource(QUrl.fromLocalFile(path))
         if autostart:
-            self.play()
+            # Pro kompatibilitu – pokud někdo volá s autostart=True, spustíme po loadu
+            def _auto():
+                try:
+                    self.media_loaded.disconnect(_auto)
+                except Exception:
+                    pass
+                self.play()
+            self.media_loaded.connect(_auto)
 
     def play(self):
-        if not self._sf:
-            return
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
-
-        # přesuň čtecí pozici na self._frame_pos
-        self._sf.seek(self._frame_pos)
-
-        self._stream = sd.OutputStream(
-            samplerate=self._samplerate,
-            channels=self._channels,
-            dtype="float32",
-            callback=self._callback,
-            blocksize=0,  # automaticky
-        )
-        self._stream.start()
-        self._playing = True
-        self._timer.start()
+        self._player.play()
 
     def pause(self):
-        if self._stream and self._playing:
-            self._stream.stop()
-            self._playing = False
-            self._timer.stop()
+        self._player.pause()
 
     def stop(self):
-        self._timer.stop()
-        self._playing = False
-        if self._stream:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
-        if self._sf:
-            try:
-                self._sf.close()
-            except Exception:
-                pass
-            self._sf = None
-        self._frame_pos = 0
+        self._player.stop()
 
-    def seek(self, pos_ms: int):
-        if not self._sf:
-            return
-        pos_ms = max(0, min(pos_ms, self._frames_to_ms(self._frames_total)))
-        with self._lock:
-            self._frame_pos = self._ms_to_frames(pos_ms)
-            self._sf.seek(self._frame_pos)
-        if not self._playing:
-            self.position_changed.emit(pos_ms)
-        else:
-            # stream běží → nic, callback načte od nové pozice
-            pass
+    def is_playing(self) -> bool:
+        return self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
 
-    def set_loop_point(self, which: str):
-        cur_ms = self._frames_to_ms(self._frame_pos)
-        if which == "A":
-            self._loop_a = cur_ms
-        elif which == "B":
-            self._loop_b = cur_ms
-        if self._loop_a is not None and self._loop_b is not None:
-            if self._loop_a > self._loop_b:
-                self._loop_a, self._loop_b = self._loop_b, self._loop_a
+    def seek(self, ms: int):
+        self._player.setPosition(max(0, int(ms)))
+
+    def duration_ms(self) -> int:
+        return int(self._player.duration() or 0)
+
+    def current_position_ms(self) -> int:
+        return int(self._player.position() or 0)
+
+    def set_loop_ms(self, a: Optional[int] = None, b: Optional[int] = None):
+        if a is not None:
+            self._loop_a = max(0, int(a))
+        if b is not None:
+            self._loop_b = max(0, int(b))
+        # sanity: if both set and a>b, swap
+        if self._loop_a is not None and self._loop_b is not None and self._loop_a > self._loop_b:
+            self._loop_a, self._loop_b = self._loop_b, self._loop_a
 
     def clear_loop(self):
         self._loop_a = None
         self._loop_b = None
 
-    # ---------- internal ----------
+    def set_volume(self, percent: int):
+        """percent 0..100"""
+        p = max(0, min(100, int(percent)))
+        # Qt6 QAudioOutput volume je 0..1 (lineární)
+        self._audio_out.setVolume(p / 100.0)
 
-    def _callback(self, outdata, frames, time_info, status):
-        if status:
-            # print(status)  # můžeš logovat
-            pass
-        if not self._sf:
-            outdata[:] = 0
+    # ---------- interní ----------
+    def _on_media_status(self, status):
+        # Signál „LoadedMedia“ je spolehlivý moment k provedení seeku atd.
+        if status == QMediaPlayer.MediaStatus.LoadedMedia:
+            self.media_loaded.emit()
+
+    def _tick_loop(self):
+        if self._loop_a is None or self._loop_b is None:
             return
-
-        with self._lock:
-            # loop kontrola – když jsme za B, skoč na A
-            if self._loop_a is not None and self._loop_b is not None:
-                if self._frame_pos >= self._ms_to_frames(self._loop_b):
-                    self._frame_pos = self._ms_to_frames(self._loop_a)
-                    self._sf.seek(self._frame_pos)
-
-            # načti blok
-            need = frames
-            data = self._sf.read(need, dtype="float32", always_2d=True)
-            read_frames = len(data)
-
-            if read_frames < need:
-                # konec tracku
-                rest = np.zeros((need - read_frames, self._channels), dtype="float32")
-                data = np.vstack([data, rest])
-                self._frame_pos += read_frames
-                outdata[:] = data
-                # zastavíme po vyhrání posledního bufferu
-                self._playing = False
-                try:
-                    self._stream.stop()
-                except Exception:
-                    pass
-                return
-
-            self._frame_pos += read_frames
-            outdata[:] = data
-
-    def _on_tick(self):
-        self.position_changed.emit(self._frames_to_ms(self._frame_pos))
-
-    def _frames_to_ms(self, frames: int) -> int:
-        return int(frames * 1000 / max(1, self._samplerate))
-
-    def _ms_to_frames(self, ms: int) -> int:
-        return int(ms * self._samplerate / 1000)
+        pos = self.current_position_ms()
+        if pos >= self._loop_b:
+            # vrať se na A a pokračuj
+            self.seek(self._loop_a)
