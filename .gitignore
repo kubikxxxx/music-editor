@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+
+
+# OS
+.DS_Store
+Thumbs.db
+
+
+# Build & packaging
+build/
+dist/
+*.spec
+
+
+# Data / artifacts
+src/data/models/
+*.wav
+*.mp3
+*.tmp.*

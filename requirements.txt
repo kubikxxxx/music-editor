@@ -1,0 +1,8 @@
+PyQt6==6.7.0
+PyQt6-Qt6>=6.7
+ffmpeg-python==0.2.0
+numpy>=1.26
+soundfile>=0.12
+librosa>=0.10
+scikit-learn>=1.5
+tensorflow==2.16.1 ; platform_system != 'Darwin' or platform_machine != 'arm64'
