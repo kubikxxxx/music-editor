@@ -87,7 +87,6 @@ class MainWindow(QMainWindow):
                 border-radius: 8px;
                 padding: 8px 16px;
                 font-size: 14px;
-                box-sizing: border-box;
                 width: 74px;
                 height: 74px;
                 border-width: 37px 0px 37px 74px;
@@ -894,7 +893,7 @@ class MainWindow(QMainWindow):
             cut = seg[:need_ms] if len(seg) >= need_ms else seg
         else:
             cut = seg
-        fade = min(400, len(cut)//10)
+        fade = len(cut)//20
         return cut.fade_in(fade).fade_out(fade)
 
     def generate_practice_latina_and_play(self):
