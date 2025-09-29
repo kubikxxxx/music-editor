@@ -1,13 +1,19 @@
 import os
+import json
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime
+import random
+from PyQt6.QtGui import QPainter, QPaintEvent, QPen, QBrush, QColor, QPolygon
 import numpy as np
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog,
     QListWidget, QListWidgetItem, QMessageBox, QSplitter, QLineEdit, QSlider, QMenu,
-    QSizePolicy
+    QSizePolicy, QCheckBox, QInputDialog
 )
-from PyQt6.QtCore import Qt, QTimer, QPoint
+from PyQt6.QtCore import Qt, QTimer, QPoint, QRegularExpression, QSize
 from PyQt6.QtGui import QShortcut, QKeySequence
 
 from audio.player import AudioPlayer
@@ -16,6 +22,7 @@ from library.manager import Library
 from ui.timeline import TimelineWidget
 
 
+# ---------- utility ----------
 def fmt_ms(ms: int) -> str:
     s = max(0, ms) // 1000
     m, s = divmod(s, 60)
@@ -25,6 +32,14 @@ def fmt_ms(ms: int) -> str:
 def probe_duration_ms(path: str) -> int:
     from pydub import AudioSegment
     return int(len(AudioSegment.from_file(path)))
+
+
+@dataclass
+class PracticaItem:
+    kind: str          # "track" nebo "gap"
+    path: str
+    start_ms: int
+    duration_ms: int
 
 
 class MainWindow(QMainWindow):
@@ -57,13 +72,42 @@ class MainWindow(QMainWindow):
         self._filtered_ids: list[str] = []
         self._current_track_id: str | None = None
 
+        # favorites (★)
+        self._favorites_local: set[str] = set()
+        self._favorites_only = False
+        self._load_favorites_local()
+
         # --- UI ---
         self.open_btn = QPushButton("Open…")
+        self.open_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #6A0DAD;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 8px 16px;
+                font-size: 14px;
+                box-sizing: border-box;
+                width: 74px;
+                height: 74px;
+                border-width: 37px 0px 37px 74px;
+            }
+            QPushButton:hover {
+                background-color: #8A2BE2;
+            }
+            QPushButton:pressed {
+                background-color: #5B0092;
+            }
+        """)
         self.prev_btn = QPushButton("Previous")
-        self.play_btn = QPushButton("Play")
-        self.pause_btn = QPushButton("Pause")
+        self.playpause_btn = PlayPauseButton()
         self.stop_btn = QPushButton("Stop")
         self.next_btn = QPushButton("Next")
+
+        # practice
+        self.practice_btn = QPushButton("Poskládat a přehrát practice (Latina)")
+        self.practice_btn.setMinimumWidth(280)
+        self.practice_btn.clicked.connect(self.generate_practice_latina_and_play)
 
         # malý posuvník hlasitosti aplikace
         self.volume_label = QLabel("Vol")
@@ -91,10 +135,16 @@ class MainWindow(QMainWindow):
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Hledat v knihovně…")
         self.list_widget = QListWidget()
+        self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list_widget.customContextMenuRequested.connect(self._show_list_context_menu)
+
         self.import_btn = QPushButton("Import…")
         self.delete_btn = QPushButton("Smazat")
         self.repair_btn = QPushButton("Opravit")
         self.relink_btn = QPushButton("Relink…")
+        self.fav_filter_chk = QCheckBox("Jen oblíbené ★")
+        self.fav_filter_chk.stateChanged.connect(self._toggle_favorites_filter)
+
         self.info_label = QLabel("")
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -114,6 +164,7 @@ class MainWindow(QMainWindow):
         rowL.addWidget(self.delete_btn)
         rowL.addWidget(self.repair_btn)
         rowL.addWidget(self.relink_btn)
+        rowL.addWidget(self.fav_filter_chk)
         left.addLayout(rowL)
         left.addWidget(self.info_label)
 
@@ -122,14 +173,15 @@ class MainWindow(QMainWindow):
         right = QVBoxLayout(right_widget)
         right.setContentsMargins(8, 8, 8, 8)
         right.setSpacing(8)
-        right.setAlignment(Qt.AlignmentFlag.AlignTop)  # << zarovnání nahoru
+        right.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         # horní řádek: transport + volume
         row1 = QHBoxLayout()
         row1.setSpacing(8)
-        for b in (self.open_btn, self.prev_btn, self.play_btn, self.pause_btn, self.stop_btn, self.next_btn):
+        for b in (self.open_btn, self.prev_btn, self.playpause_btn, self.stop_btn, self.next_btn):
             b.setMinimumWidth(76)
             row1.addWidget(b)
+        row1.addWidget(self.practice_btn)
         row1.addStretch(1)
         row1.addWidget(self.volume_label)
         row1.addWidget(self.volume_slider)
@@ -176,9 +228,9 @@ class MainWindow(QMainWindow):
 
         # ovládání
         self.open_btn.clicked.connect(self.open_file_direct)
-        self.play_btn.clicked.connect(self.on_play_clicked)
-        self.pause_btn.clicked.connect(self.player.pause)
-        self.stop_btn.clicked.connect(self.player.stop)
+        # Play/Pause – jednotné ovládání
+        self.playpause_btn.clicked.connect(self.toggle_play_pause)
+        self.stop_btn.clicked.connect(self._on_stop_clicked)
         self.prev_btn.clicked.connect(self.play_previous_in_filter)
         self.next_btn.clicked.connect(self.play_next_in_filter)
 
@@ -197,9 +249,98 @@ class MainWindow(QMainWindow):
         self.refresh_list(show_locations=True)
         self.repair_if_needed()
 
+    # ---------- favorites (★) ----------
+    def _fav_store_path(self) -> str | None:
+        try:
+            lib_dir, _ = self.library.locations()
+            if not lib_dir:
+                return None
+            p = os.path.join(lib_dir, "_favorites.json")
+            return p
+        except Exception:
+            return None
+
+    def _load_favorites_local(self):
+        p = self._fav_store_path()
+        if not p or not os.path.isfile(p):
+            self._favorites_local = set()
+            return
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._favorites_local = set(data if isinstance(data, list) else [])
+        except Exception:
+            self._favorites_local = set()
+
+    def _save_favorites_local(self):
+        p = self._fav_store_path()
+        if not p:
+            return
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(sorted(self._favorites_local), f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _library_has_fav_api(self) -> bool:
+        return all(hasattr(self.library, name) for name in ("set_favorite", "is_favorite"))
+
+    def _is_favorite(self, track_id: str) -> bool:
+        try:
+            if self._library_has_fav_api():
+                return bool(self.library.is_favorite(track_id))
+        except Exception:
+            pass
+        return track_id in self._favorites_local
+
+    def _set_favorite(self, track_id: str, value: bool):
+        try:
+            if self._library_has_fav_api():
+                self.library.set_favorite(track_id, value)
+            else:
+                if value:
+                    self._favorites_local.add(track_id)
+                else:
+                    self._favorites_local.discard(track_id)
+                self._save_favorites_local()
+        except Exception:
+            # fallback na lokální
+            if value:
+                self._favorites_local.add(track_id)
+            else:
+                self._favorites_local.discard(track_id)
+            self._save_favorites_local()
+
+    def _toggle_favorites_filter(self, *_):
+        self._favorites_only = self.fav_filter_chk.isChecked()
+        self.refresh_list(show_locations=False)
+
+    def _show_list_context_menu(self, pos: QPoint):
+        item = self.list_widget.itemAt(pos)
+        menu = QMenu(self)
+        if item:
+            track_id = item.data(Qt.ItemDataRole.UserRole)
+            fav_now = self._is_favorite(track_id)
+            act_fav = menu.addAction("Odebrat z oblíbených ★" if fav_now else "Označit jako oblíbené ★")
+            menu.addSeparator()
+            act_play = menu.addAction("Přehrát")
+            chosen = menu.exec(self.list_widget.mapToGlobal(pos))
+            if not chosen:
+                return
+            if chosen == act_fav:
+                self._set_favorite(track_id, not fav_now)
+                self.refresh_list(show_locations=False)
+            elif chosen == act_play:
+                self._play_track_id(track_id)
+        else:
+            act_reload = menu.addAction("Obnovit seznam")
+            chosen = menu.exec(self.list_widget.mapToGlobal(pos))
+            if chosen == act_reload:
+                self.refresh_list(show_locations=False)
+
     # ---------- shortcuts ----------
     def _install_shortcuts(self):
-        QShortcut(QKeySequence("Space"), self, activated=self._toggle_play_pause)
+        QShortcut(QKeySequence("Space"), self, activated=self.toggle_play_pause)
         QShortcut(QKeySequence("R"), self, activated=self._reset_tempo)
         QShortcut(QKeySequence("Left"), self, activated=lambda: self._nudge(-5000))
         QShortcut(QKeySequence("Right"), self, activated=lambda: self._nudge(5000))
@@ -208,11 +349,30 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("F11"), self, activated=self._toggle_fullscreen)
         QShortcut(QKeySequence("Esc"), self, activated=self._exit_fullscreen)
 
-    def _toggle_play_pause(self):
+    def toggle_play_pause(self):
+        """Jednotné ovládání Play/Pause z tlačítka i klávesnice."""
+        # pokud čeká změna tempa, nejdříve ji aplikuj
+        if self._tempo_timer.isActive():
+            self._tempo_timer.stop()
+            self._apply_pending_tempo()
+            # _apply_pending_tempo po loadu a resume pustí play
+            self.playpause_btn.setChecked(True)
+            return
+
         if self.player.is_playing():
-            self.player.pause()
+            # Pauza
+            try:
+                self.player.pause()
+            except AttributeError:
+                # fallback, pokud AudioPlayer nemá pause()
+                pos = self.player.current_position_ms()
+                self.player.stop()
+                self.player.seek(pos)
+            self.playpause_btn.setChecked(False)
         else:
-            self.on_play_clicked()
+            # Play
+            self.player.play()
+            self.playpause_btn.setChecked(True)
 
     def _reset_tempo(self):
         self._pending_tempo = 1.0
@@ -266,12 +426,17 @@ class MainWindow(QMainWindow):
         try:
             tracks = self.library.list_tracks()
             for t in tracks:
-                if query and query not in t.title.lower():
+                title = t.title or ""
+                if query and query not in title.lower():
                     continue
-                item = QListWidgetItem(f"{t.title}  ({t.duration_ms//1000}s)")
-                item.setData(Qt.ItemDataRole.UserRole, t.id)
+                tid = t.id
+                if self._favorites_only and not self._is_favorite(tid):
+                    continue
+                star = " ★" if self._is_favorite(tid) else ""
+                item = QListWidgetItem(f"{title}{star}  ({(t.duration_ms or 0)//1000}s)")
+                item.setData(Qt.ItemDataRole.UserRole, tid)
                 self.list_widget.addItem(item)
-                self._filtered_ids.append(t.id)
+                self._filtered_ids.append(tid)
         except Exception as e:
             QMessageBox.warning(self, "Library error", str(e))
         if show_locations:
@@ -346,6 +511,8 @@ class MainWindow(QMainWindow):
                                 ) == QMessageBox.StandardButton.Yes:
             try:
                 self.library.remove(track_id)
+                # smaž i z oblíbených
+                self._set_favorite(track_id, False)
                 self.refresh_list()
             except Exception as e:
                 QMessageBox.critical(self, "Delete error", str(e))
@@ -402,6 +569,7 @@ class MainWindow(QMainWindow):
             self._update_time_scale()
             self.player.seek(0)
             self.player.play()
+            self.playpause_btn.setChecked(True)  # synchronizace stavu tlačítka
 
         self.player.media_loaded.connect(_resume)
         self.player.load(path, autostart=False)
@@ -532,6 +700,9 @@ class MainWindow(QMainWindow):
                 self.player.set_loop_ms(a=a_r, b=b_r)
             if was_playing:
                 self.player.play()
+                self.playpause_btn.setChecked(True)
+            else:
+                self.playpause_btn.setChecked(False)
 
         self.player.media_loaded.connect(_resume)
         self.player.load(new_path, autostart=False)
@@ -555,11 +726,13 @@ class MainWindow(QMainWindow):
 
     # ---------- tempo ----------
     def on_play_clicked(self):
+        """Pokud chceš mít i separátní 'Play' akci mimo toggle – zachováno kvůli kompatibilitě."""
         if self._tempo_timer.isActive():
             self._tempo_timer.stop()
             self._apply_pending_tempo()
             return
         self.player.play()
+        self.playpause_btn.setChecked(True)
 
     def on_tempo_slider_changed(self, val: int):
         self._pending_tempo = val / 100.0
@@ -599,3 +772,308 @@ class MainWindow(QMainWindow):
         self._current_track_id = None
         self._gain_regions = []
         self._load_and_play_original(path)
+
+    # ---------- PRÁCTICA: poskládat WAV, přidat do knihovny a přehrát ----------
+    def _pick_length_seconds(self) -> int:
+        items = ["01:30", "01:40", "02:00"]
+        text, ok = QInputDialog.getItem(self, "Délka skladby", "Zvol délku každé skladby:", items, 0, True)
+        if not ok or not text:
+            return -1
+        text = text.strip()
+        if ":" in text:
+            m, s = text.split(":", 1)
+            try:
+                return max(1, int(m) * 60 + int(s))
+            except Exception:
+                return -1
+        try:
+            return max(1, int(text))
+        except Exception:
+            return -1
+
+    def _pick_gap_seconds(self) -> int:
+        items = ["20", "15", "30"]
+        text, ok = QInputDialog.getItem(self, "Mezihudba", "Délka tiché mezery mezi tanci (s):", items, 0, True)
+        if not ok or not text:
+            return -1
+        try:
+            return max(0, int(text))
+        except Exception:
+            return -1
+
+    def _find_track_for_dance(self, dance_name: str, *, use_ui_filters: bool = True,
+                              used_ids: set[str] | None = None) -> tuple[str, int] | None:
+        """
+        Vrátí (path, duration_ms) NÁHODNÉ vyhovující skladby z knihovny.
+        - use_ui_filters=True => respektuje text v search boxu a „Jen oblíbené ★“.
+        - used_ids => pokud je předáno, pokusí se vyhnout už použitým ID (pro různá kola výběru).
+        """
+        synonyms = {
+            "samba": [r"\bsamba\b"],
+            "cha cha": [r"\bcha\b.*\bcha\b", r"\bchacha\b", r"\bcha-cha\b", r"\bcha\s*cha\b"],
+            "rumba": [r"\brumba\b", r"\brhumba\b"],
+            "paso doble": [r"\bpaso\b.*\bdoble\b", r"\bpasodoble\b", r"\bpaso\b"],
+            "jive": [r"\bjive\b"],
+        }
+        pats = [QRegularExpression(p, QRegularExpression.PatternOption.CaseInsensitiveOption)
+                for p in synonyms.get(dance_name, [dance_name])]
+
+        query = (self.search_edit.text() or "").strip().lower() if use_ui_filters else ""
+        fav_only = self._favorites_only if use_ui_filters else False
+
+        candidates: list[tuple[str, str, int]] = []  # (track_id, path, dur_ms)
+
+        try:
+            tracks = self.library.list_tracks()
+            for t in tracks:
+                title = (t.title or "")
+                title_l = title.lower()
+
+                # UI filtr: text + jen oblíbené
+                if use_ui_filters and query and query not in title_l:
+                    continue
+                if use_ui_filters and fav_only and not self._is_favorite(t.id):
+                    continue
+
+                # match na název dle tance
+                if any(rx.match(title_l).hasMatch() for rx in pats):
+                    path = self.library.get_track_path(t.id)
+                    if not path or not os.path.isfile(path):
+                        continue
+                    dur = int(getattr(t, "duration_ms", 0)) or probe_duration_ms(path)
+                    candidates.append((t.id, path, dur))
+        except Exception:
+            pass
+
+        if not candidates:
+            return None
+
+        # pokud máme použité ID, zkus je vyloučit
+        if used_ids:
+            fresh = [c for c in candidates if c[0] not in used_ids]
+            if fresh:
+                candidates = fresh
+
+        tid, path, dur = random.choice(candidates)
+        if used_ids is not None:
+            used_ids.add(tid)
+        return path, dur
+
+    def _make_gap_segment(self, seconds: int):
+        """
+        Vrátí úsek 'mezihudby' o délce `seconds`.
+        - Pokud v knihovně existuje skladba obsahující 'mezihudba' v názvu, vezme se její začátek.
+        - Jinak se vytvoří tichý segment.
+        """
+        from pydub import AudioSegment
+
+        duration_ms = max(0, int(seconds * 1000))
+
+        try:
+            # projdi knihovnu a hledej "mezihudba"
+            for t in self.library.list_tracks():
+                if "mezihudba" in (t.title or "").lower():
+                    path = self.library.get_track_path(t.id)
+                    if path and os.path.isfile(path):
+                        seg = AudioSegment.from_file(path)
+                        if len(seg) > duration_ms:
+                            seg = seg[:duration_ms]
+                        return seg
+        except Exception as e:
+            print(f"Chyba při hledání mezihudby: {e}")
+
+        # fallback: ticho
+        return AudioSegment.silent(duration=duration_ms)
+
+    def _load_clip(self, path: str, clip_seconds: int, dance):
+        """Načte audio a vrátí segment délky `clip_seconds` se short fade-in/out, aby to nelupalo."""
+        from pydub import AudioSegment
+        seg = AudioSegment.from_file(path)
+        need_ms = max(1000, int(clip_seconds * 1000))
+        if(dance != "paso doble"):
+            cut = seg[:need_ms] if len(seg) >= need_ms else seg
+        else:
+            cut = seg
+        fade = min(400, len(cut)//10)
+        return cut.fade_in(fade).fade_out(fade)
+
+    def generate_practice_latina_and_play(self):
+        """
+        Sestaví jeden WAV (Samba → Cha-cha → Rumba → Paso doble → Jive) s tichými mezerami,
+        dočasně uloží do knihovny a ihned ho pustí jako jednu skladbu.
+        """
+        clip_len_s = self._pick_length_seconds()
+        if clip_len_s <= 0:
+            return
+        gap_s = self._pick_gap_seconds()
+        if gap_s < 0:
+            return
+
+        dances = ["samba", "cha cha", "rumba", "paso doble", "jive"]
+
+        try:
+            from pydub import AudioSegment
+        except Exception:
+            QMessageBox.critical(self, "Chybí závislosti",
+                                 "K generování je potřeba pydub a funkční FFmpeg v PATH.")
+            return
+
+        segments: list[AudioSegment] = []
+        missing: list[str] = []
+
+        for d in dances:
+            found = self._find_track_for_dance(d)
+            if not found:
+                missing.append(d); continue
+            path, _dur_ms = found
+            try:
+                clip = self._load_clip(path, clip_len_s, d)
+                segments.append(clip)
+                if gap_s > 0 and d != dances[-1]:
+                    segments.append(self._make_gap_segment(gap_s))
+            except Exception as e:
+                missing.append(f"{d} ({os.path.basename(path)}: {e})")
+
+        if not segments:
+            QMessageBox.warning(self, "Nenalezeno", "V knihovně se nenašly skladby pro Latinské tance.")
+            return
+
+        if missing:
+            QMessageBox.information(self, "Upozornění",
+                                    "Něco chybí/nešlo zpracovat: " + ", ".join(missing))
+
+        try:
+            final_mix = segments[0]
+            for seg in segments[1:]:
+                final_mix += seg
+        except Exception as e:
+            QMessageBox.critical(self, "Chyba mixu", str(e))
+            return
+
+        # uložit do dočasné složky knihovny a přidat do Library
+        try:
+            lib_dir, _db_path = self.library.locations()
+            out_dir = os.path.join(lib_dir, "_practice_temp")
+            os.makedirs(out_dir, exist_ok=True)
+
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_name = f"Practice_Latin_{clip_len_s}s_gap{gap_s}s_{stamp}.wav"
+            out_path = os.path.join(out_dir, base_name)
+
+            final_mix.export(out_path, format="wav")
+        except Exception as e:
+            QMessageBox.critical(self, "Export dočasného WAV selhal", str(e))
+            return
+
+        # přidat do knihovny + přehrát
+        try:
+            self.library.add_file(out_path)
+        except Exception as e:
+            # fallback – přehrajeme přímo
+            self._current_track_id = None
+            self._gain_regions = []
+            self._load_and_play_original(out_path)
+            QMessageBox.warning(self, "Nelze přidat do knihovny",
+                                f"Soubor se nepodařilo zapsat do knihovny, přehrávám přímo.\n\n{e}")
+            return
+
+        try:
+            self.refresh_list(show_locations=False)
+            target_title = os.path.splitext(base_name)[0].lower()
+            track_id = None
+            for t in self.library.list_tracks():
+                if (t.title or "").lower() == target_title:
+                    track_id = t.id
+                    break
+
+            if track_id:
+                self._play_track_id(track_id)
+            else:
+                self._current_track_id = None
+                self._gain_regions = []
+                self._load_and_play_original(out_path)
+        except Exception:
+            self._current_track_id = None
+            self._gain_regions = []
+            self._load_and_play_original(out_path)
+
+        QMessageBox.information(self, "Practice připraven",
+                                f"Poskládaná skladba je v knihovně jako:\n{base_name}")
+
+    # ---------- pomocné ovládací akce ----------
+    def _on_stop_clicked(self):
+        self.player.stop()
+        self.playpause_btn.setChecked(False)
+
+
+class PlayPauseButton(QPushButton):
+    """
+    Vykreslí Play (trojúhelník) / Pause (dvě svislé čáry) bez ikon.
+    Stav se řídí .isChecked(): checked=True => Playing (Pause ikonka), False => Paused/Stopped (Play ikonka).
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._bg = QColor("#222")  # pozadí
+        self._fg = QColor("#fff")  # symbol
+        self._bg_hover = QColor("#333")
+        self._bg_press = QColor("#111")
+        self._radius = 8
+        self.setMinimumSize(44, 36)
+        self.setMaximumHeight(36)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setToolTip("Play/Pause (Space)")
+
+    def sizeHint(self) -> QSize:
+        return QSize(52, 36)
+
+    def _bg_color(self):
+        if self.isDown():
+            return self._bg_press
+        if self.underMouse():
+            return self._bg_hover
+        return self._bg
+
+    def paintEvent(self, e: QPaintEvent) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect().adjusted(1, 1, -1, -1)
+
+        # background
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(self._bg_color()))
+        p.drawRoundedRect(rect, self._radius, self._radius)
+
+        # symbol (play/pause)
+        p.setBrush(QBrush(self._fg))
+        p.setPen(Qt.PenStyle.NoPen)
+
+        w = rect.width()
+        h = rect.height()
+        cx = rect.x() + w // 2
+        cy = rect.y() + h // 2
+
+        if not self.isChecked():
+            # PLAY ▶ (trojúhelník směřující doprava)
+            side = int(min(w, h) * 0.3)
+            x0 = cx - side // 2
+            poly = QPolygon([
+                QPoint(x0, cy - side),
+                QPoint(x0, cy + side),
+                QPoint(x0 + int(side * 1.15), cy),
+            ])
+            p.drawConvexPolygon(poly)
+        else:
+            # PAUSE ‖ (dva sloupky)
+            bar_w = max(3, int(w * 0.08))
+            bar_h = int(h * 0.52)
+            gap = int(w * 0.07)
+            x1 = cx - gap - bar_w
+            x2 = cx + gap
+            y = cy - bar_h // 2
+            p.drawRoundedRect(x1, y, bar_w, bar_h, 2, 2)
+            p.drawRoundedRect(x2, y, bar_w, bar_h, 2, 2)
+
+        p.end()
