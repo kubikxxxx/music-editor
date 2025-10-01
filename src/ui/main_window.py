@@ -88,7 +88,7 @@ class MainWindow(QMainWindow):
                 padding: 8px 16px;
                 font-size: 14px;
                 width: 74px;
-                height: 74px;
+                height: 20px;
                 border-width: 37px 0px 37px 74px;
             }
             QPushButton:hover {
@@ -99,14 +99,71 @@ class MainWindow(QMainWindow):
             }
         """)
         self.prev_btn = QPushButton("Previous")
+        self.prev_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #6A0DAD;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 8px 16px;
+                font-size: 14px;
+                width: 74px;
+                height: 20px;
+                border-width: 37px 0px 37px 74px;
+            }
+            QPushButton:hover {
+                background-color: #8A2BE2;
+            }
+            QPushButton:pressed {
+                background-color: #5B0092;
+            }
+        """)
         self.playpause_btn = PlayPauseButton()
         self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #6A0DAD;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 8px 16px;
+                font-size: 14px;
+                width: 74px;
+                height: 20px;
+                border-width: 37px 0px 37px 74px;
+            }
+            QPushButton:hover {
+                background-color: #8A2BE2;
+            }
+            QPushButton:pressed {
+                background-color: #5B0092;
+            }
+        """)
         self.next_btn = QPushButton("Next")
+        self.next_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #6A0DAD;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 8px 16px;
+                font-size: 14px;
+                width: 74px;
+                height: 20px;
+                border-width: 37px 0px 37px 74px;
+            }
+            QPushButton:hover {
+                background-color: #8A2BE2;
+            }
+            QPushButton:pressed {
+                background-color: #5B0092;
+            }
+        """)
 
         # practice
-        self.practice_btn = QPushButton("Poskládat a přehrát practice (Latina)")
+        self.practice_btn = QPushButton("Poskládat a přehrát practice")
         self.practice_btn.setMinimumWidth(280)
-        self.practice_btn.clicked.connect(self.generate_practice_latina_and_play)
+        self.practice_btn.clicked.connect(self.generate_practice_and_play)
 
         # malý posuvník hlasitosti aplikace
         self.volume_label = QLabel("Vol")
@@ -227,7 +284,6 @@ class MainWindow(QMainWindow):
 
         # ovládání
         self.open_btn.clicked.connect(self.open_file_direct)
-        # Play/Pause – jednotné ovládání
         self.playpause_btn.clicked.connect(self.toggle_play_pause)
         self.stop_btn.clicked.connect(self._on_stop_clicked)
         self.prev_btn.clicked.connect(self.play_previous_in_filter)
@@ -772,7 +828,7 @@ class MainWindow(QMainWindow):
         self._gain_regions = []
         self._load_and_play_original(path)
 
-    # ---------- PRÁCTICA: poskládat WAV, přidat do knihovny a přehrát ----------
+    # ---------- PRACTICE: poskládat WAV, přidat do knihovny a přehrát ----------
     def _pick_length_seconds(self) -> int:
         items = ["01:30", "01:40", "02:00"]
         text, ok = QInputDialog.getItem(self, "Délka skladby", "Zvol délku každé skladby:", items, 0, True)
@@ -787,6 +843,17 @@ class MainWindow(QMainWindow):
                 return -1
         try:
             return max(1, int(text))
+        except Exception:
+            return -1
+
+    def _pick_dance_style(self) -> int:
+        items = ["LAT", "STT"]
+        text, ok = QInputDialog.getItem(self, "Typ tance", "Zvol typ practicu:", items, 0, True)
+        if not ok or not text:
+            return -1
+        text = text.strip()
+        try:
+            return 1 if text == "LAT" else 0
         except Exception:
             return -1
 
@@ -813,6 +880,16 @@ class MainWindow(QMainWindow):
             "rumba": [r"\brumba\b", r"\brhumba\b"],
             "paso doble": [r"\bpaso\b.*\bdoble\b", r"\bpasodoble\b", r"\bpaso\b"],
             "jive": [r"\bjive\b"],
+            "waltz": [
+                r"(?<!viennese\s)\bwaltz\b",
+            ],
+            "tango": [r"\btango\b"],
+            "viennese waltz": [
+                r"\bviennese\b.*\bwaltz\b",
+                r"\bvalčík\b"
+            ],
+            "slowfox": [r"\bslow\s*fox\b", r"\bslowfox\b", r"\bfoxtrot\b"],
+            "quickstep": [r"\bquick\s*step\b", r"\bquickstep\b"],
         }
         pats = [QRegularExpression(p, QRegularExpression.PatternOption.CaseInsensitiveOption)
                 for p in synonyms.get(dance_name, [dance_name])]
@@ -896,19 +973,22 @@ class MainWindow(QMainWindow):
         fade = len(cut)//20
         return cut.fade_in(fade).fade_out(fade)
 
-    def generate_practice_latina_and_play(self):
+    def generate_practice_and_play(self):
         """
-        Sestaví jeden WAV (Samba → Cha-cha → Rumba → Paso doble → Jive) s tichými mezerami,
-        dočasně uloží do knihovny a ihned ho pustí jako jednu skladbu.
+        Sestaví jeden WAV (Samba → Cha-cha → Rumba → Paso doble → Jive) s mezerami vyplněnými souborem obsahujícím mezihudba, nebo tichem.
+        Dočasně uloží do knihovny a ihned ho pustí jako jednu skladbu.
         """
+        type = self._pick_dance_style()
         clip_len_s = self._pick_length_seconds()
         if clip_len_s <= 0:
             return
         gap_s = self._pick_gap_seconds()
         if gap_s < 0:
             return
-
-        dances = ["samba", "cha cha", "rumba", "paso doble", "jive"]
+        if type == 1:
+            dances = ["samba", "cha cha", "rumba", "paso doble", "jive"]
+        else:
+            dances = ["waltz", "tango", "viennese waltz", "slowfox", "quickstep"]
 
         try:
             from pydub import AudioSegment
@@ -956,7 +1036,10 @@ class MainWindow(QMainWindow):
             os.makedirs(out_dir, exist_ok=True)
 
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            base_name = f"Practice_Latin_{clip_len_s}s_gap{gap_s}s_{stamp}.wav"
+            if type == 1:
+                base_name = f"Practice_Latin_{clip_len_s}s_gap{gap_s}s_{stamp}.wav"
+            else:
+                base_name = f"Practice_Standart_{clip_len_s}s_gap{gap_s}s_{stamp}.wav"
             out_path = os.path.join(out_dir, base_name)
 
             final_mix.export(out_path, format="wav")
@@ -1017,8 +1100,6 @@ class PlayPauseButton(QPushButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._bg = QColor("#222")  # pozadí
         self._fg = QColor("#fff")  # symbol
-        self._bg_hover = QColor("#333")
-        self._bg_press = QColor("#111")
         self._radius = 8
         self.setMinimumSize(44, 36)
         self.setMaximumHeight(36)
@@ -1029,10 +1110,6 @@ class PlayPauseButton(QPushButton):
         return QSize(52, 36)
 
     def _bg_color(self):
-        if self.isDown():
-            return self._bg_press
-        if self.underMouse():
-            return self._bg_hover
         return self._bg
 
     def paintEvent(self, e: QPaintEvent) -> None:
@@ -1042,7 +1119,7 @@ class PlayPauseButton(QPushButton):
 
         # background
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(self._bg_color()))
+        # p.setBrush(QBrush(self._bg_color()))
         p.drawRoundedRect(rect, self._radius, self._radius)
 
         # symbol (play/pause)
