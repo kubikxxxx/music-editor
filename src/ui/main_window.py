@@ -1,9 +1,13 @@
+# src/ui/main_window.py
 import os
 import json
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 import random
+import sys
+import time
+
 from PyQt6.QtGui import QPainter, QPaintEvent, QPen, QBrush, QColor, QPolygon
 import numpy as np
 
@@ -13,13 +17,151 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QMessageBox, QSplitter, QLineEdit, QSlider, QMenu,
     QSizePolicy, QCheckBox, QInputDialog
 )
-from PyQt6.QtCore import Qt, QTimer, QPoint, QRegularExpression, QSize
+from PyQt6.QtCore import (
+    Qt, QTimer, QPoint, QRegularExpression, QSize,
+    QAbstractNativeEventFilter, QCoreApplication, QEvent
+)
 from PyQt6.QtGui import QShortcut, QKeySequence
 
 from audio.player import AudioPlayer
 from audio.processing import render_variant
 from library.manager import Library
 from ui.timeline import TimelineWidget
+
+
+# =========================
+#  Windows media handler
+# =========================
+if sys.platform.startswith("win"):
+    import ctypes
+    from ctypes import wintypes
+
+    class _POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    class _MSG(ctypes.Structure):
+        _fields_ = [
+            ("hwnd",    wintypes.HWND),
+            ("message", wintypes.UINT),
+            ("wParam",  wintypes.WPARAM),
+            ("lParam",  wintypes.LPARAM),
+            ("time",    wintypes.DWORD),
+            ("pt",      _POINT),
+        ]
+
+    class WinMediaKeyFilter(QAbstractNativeEventFilter):
+        """Zachytává WM_HOTKEY (globálně), WM_APPCOMMAND a případně VK_MEDIA_*."""
+        WM_APPCOMMAND = 0x0319
+        WM_HOTKEY     = 0x0312
+        WM_KEYDOWN    = 0x0100
+        WM_SYSKEYDOWN = 0x0104
+
+        # hotkey: použijeme pouze Play/Pause
+        # MOD_NOREPEAT záměrně NEpoužíváme – chceme přijímat každý impuls
+        VK_MEDIA_PLAY_PAUSE = 0xB3
+        HOTKEY_ID_PLAYPAUSE = 0xA110
+
+        # APPCOMMAND kódy
+        APPCOMMAND_MEDIA_PLAY_PAUSE = 14
+        APPCOMMAND_MEDIA_PLAY       = 46
+        APPCOMMAND_MEDIA_PAUSE      = 47
+
+        def __init__(self, on_playpause, on_play, on_pause, *, debug=True):
+            super().__init__()
+            self.on_playpause = on_playpause
+            self.on_play = on_play
+            self.on_pause = on_pause
+            self.debug = bool(debug)
+            self._hotkey_registered = False
+            self._hotkey_hwnd = None  # HWND, na které je hotkey registrován
+
+        def _log(self, msg: str):
+            if self.debug:
+                print(msg, flush=True)
+
+        def register_global_playpause_hotkey(self, hwnd: int | None = None):
+            """
+            Globální hotkey – funguje i když app není v popředí.
+            Nepoužíváme MOD_NOREPEAT, aby systém nic „nedržel“.
+            """
+            user32 = ctypes.windll.user32
+            try:
+                if self._hotkey_registered:
+                    self._log("[HOTKEY] Re-register requested -> unregistering first")
+                    self.unregister_global_playpause_hotkey()
+            except Exception:
+                pass
+
+            h = wintypes.HWND(hwnd) if hwnd else wintypes.HWND(0)
+            # modifiers = 0 → žádný MOD_*, chceme každý impuls
+            ok = user32.RegisterHotKey(h, self.HOTKEY_ID_PLAYPAUSE, 0, self.VK_MEDIA_PLAY_PAUSE)
+            self._hotkey_registered = bool(ok)
+            self._hotkey_hwnd = h if ok else None
+            self._log(f"[HOTKEY] Register VK_MEDIA_PLAY_PAUSE (hwnd={int(hwnd) if hwnd else 0}) -> {'OK' if ok else 'FAIL'}")
+
+        def unregister_global_playpause_hotkey(self):
+            if not self._hotkey_registered:
+                return
+            user32 = ctypes.windll.user32
+            h = self._hotkey_hwnd if self._hotkey_hwnd is not None else wintypes.HWND(0)
+            user32.UnregisterHotKey(h, self.HOTKEY_ID_PLAYPAUSE)
+            self._hotkey_registered = False
+            self._hotkey_hwnd = None
+            self._log("[HOTKEY] Unregistered")
+
+        def nativeEventFilter(self, eventType, message):
+            # PyQt6: eventType je QByteArray → převedeme na str
+            try:
+                etype = bytes(eventType).decode(errors="ignore") if eventType is not None else ""
+            except Exception:
+                etype = str(eventType or "")
+            if not etype.startswith("windows_"):
+                return False, 0
+
+            # adresa MSG
+            try:
+                addr = int(message)
+            except Exception:
+                try:
+                    addr = int(message.__int__())
+                except Exception:
+                    return False, 0
+
+            msg = _MSG.from_address(addr)
+            m = int(msg.message)
+            wParam = int(msg.wParam)
+            lParam = int(msg.lParam)
+
+            # --- Globální WM_HOTKEY (na pozadí) ---
+            if m == self.WM_HOTKEY:
+                hot_id = wParam
+                vk = (lParam >> 16) & 0xFFFF
+                mod = lParam & 0xFFFF
+                self._log(f"[WM_HOTKEY] id={hot_id} vk=0x{vk:02X} mod=0x{mod:04X}")
+                if hot_id == self.HOTKEY_ID_PLAYPAUSE and vk == self.VK_MEDIA_PLAY_PAUSE:
+                    self.on_playpause(); return True, 0
+                return False, 0
+
+            # --- WM_APPCOMMAND (když je okno v popředí) ---
+            if m == self.WM_APPCOMMAND:
+                cmd = (lParam >> 16) & 0xFFFF
+                self._log(f"[WM_APPCOMMAND] cmd={cmd}")
+                if cmd == self.APPCOMMAND_MEDIA_PLAY_PAUSE:
+                    self.on_playpause(); return True, 0
+                if cmd == self.APPCOMMAND_MEDIA_PLAY:
+                    self.on_play();      return True, 0
+                if cmd == self.APPCOMMAND_MEDIA_PAUSE:
+                    self.on_pause();     return True, 0
+                return False, 0
+
+            # --- VK_MEDIA_PLAY_PAUSE přes WM_KEYDOWN/WM_SYSKEYDOWN (fallback) ---
+            if m in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN):
+                vk = wParam & 0xFFFF
+                if vk == self.VK_MEDIA_PLAY_PAUSE:
+                    self._log(f"[{('WM_SYSKEYDOWN' if m==self.WM_SYSKEYDOWN else 'WM_KEYDOWN')}] vk=0x{vk:02X}")
+                    self.on_playpause(); return True, 0
+
+            return False, 0
 
 
 # ---------- utility ----------
@@ -54,13 +196,9 @@ class MainWindow(QMainWindow):
         self._original_path: str | None = None
         self._original_duration_ms: int | None = None
 
-        # tempo staging
+        # tempo (apply on release)
         self._applied_tempo = 1.0
         self._pending_tempo = 1.0
-        self._tempo_timer = QTimer(self)
-        self._tempo_timer.setSingleShot(True)
-        self._tempo_timer.setInterval(1000)
-        self._tempo_timer.timeout.connect(self._apply_pending_tempo)
 
         # render→originál time-scale
         self._render_to_orig = 1.0
@@ -76,6 +214,11 @@ class MainWindow(QMainWindow):
         self._favorites_local: set[str] = set()
         self._favorites_only = False
         self._load_favorites_local()
+
+        # --- AutoNext stav ---
+        self._user_stopped = False
+        self._user_paused = False
+        self._was_playing = False
 
         # --- UI ---
         self.open_btn = QPushButton("Open…")
@@ -237,6 +380,12 @@ class MainWindow(QMainWindow):
         for b in (self.open_btn, self.prev_btn, self.playpause_btn, self.stop_btn, self.next_btn):
             b.setMinimumWidth(76)
             row1.addWidget(b)
+
+        # AutoNext checkbox
+        self._auto_next_chk = QCheckBox("Autoplay")
+        self._auto_next_chk.setChecked(True)
+        row1.addWidget(self._auto_next_chk)
+
         row1.addWidget(self.practice_btn)
         row1.addStretch(1)
         row1.addWidget(self.volume_label)
@@ -290,6 +439,7 @@ class MainWindow(QMainWindow):
         self.next_btn.clicked.connect(self.play_next_in_filter)
 
         self.tempo_slider.valueChanged.connect(self.on_tempo_slider_changed)
+        self.tempo_slider.sliderReleased.connect(self._apply_pending_tempo_on_release)
         self.volume_slider.valueChanged.connect(self.player.set_volume)
 
         self.import_btn.clicked.connect(self.import_tracks)
@@ -300,6 +450,44 @@ class MainWindow(QMainWindow):
         self.search_edit.textChanged.connect(lambda *_: self.refresh_list(show_locations=False))
 
         self._install_shortcuts()
+
+        # AutoNext watchdog
+        self._autonext_timer = QTimer(self)
+        self._autonext_timer.setInterval(200)
+        self._autonext_timer.timeout.connect(self._check_autonext)
+        self._autonext_timer.start()
+
+        # Windows: napojení Play/Pause z AirPodů (globální hotkey + APPCOMMAND + VK fallback)
+        if sys.platform.startswith("win"):
+            def _do_toggle():
+                if self.player.is_playing():
+                    try:
+                        self.player.pause()
+                    except AttributeError:
+                        pos = self.player.current_position_ms()
+                        self.player.stop(); self.player.seek(pos)
+                    self.playpause_btn.setChecked(False)
+                    self._user_paused = True; self._user_stopped = False
+                else:
+                    self.player.play()
+                    self.playpause_btn.setChecked(True)
+                    self._user_paused = False; self._user_stopped = False
+
+            # Bez jakéhokoli debouncu – každá událost se provede hned
+            def _pp_on_media_toggle():
+                _do_toggle()
+
+            self._win_media_filter = WinMediaKeyFilter(
+                on_playpause=_pp_on_media_toggle,
+                on_play=_pp_on_media_toggle,   # sjednoceně toggle
+                on_pause=_pp_on_media_toggle,
+                debug=True  # uvidíš OK/FAIL a příchozí zprávy
+            )
+            QCoreApplication.instance().installNativeEventFilter(self._win_media_filter)
+
+            # ZAJISTI, že existuje skutečné HWND a zaregistruj hotkey na něj
+            hwnd = int(self.winId())  # vynutí vytvoření okna a získá HWND
+            self._win_media_filter.register_global_playpause_hotkey(hwnd)
 
         self.refresh_list(show_locations=True)
         self.repair_if_needed()
@@ -401,19 +589,29 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Right"), self, activated=lambda: self._nudge(5000))
         QShortcut(QKeySequence("MediaNext"), self, activated=self.play_next_in_filter)
         QShortcut(QKeySequence("MediaPrevious"), self, activated=self.play_previous_in_filter)
+        # ZÁMĚRNĚ NEregistrujeme MediaPlay/MediaPause/MediaPlayPause jako QShortcut – řeší nativní filter
         QShortcut(QKeySequence("F11"), self, activated=self._toggle_fullscreen)
         QShortcut(QKeySequence("Esc"), self, activated=self._exit_fullscreen)
 
+    def changeEvent(self, ev):
+        """Pře-registruj hotkey, pokud by se změnil WinId (HWND)."""
+        if sys.platform.startswith("win") and ev.type() == QEvent.Type.WinIdChange:
+            try:
+                self._win_media_filter.register_global_playpause_hotkey(int(self.winId()))
+            except Exception:
+                pass
+        return super().changeEvent(ev)
+
+    def closeEvent(self, ev):
+        if sys.platform.startswith("win"):
+            try:
+                self._win_media_filter.unregister_global_playpause_hotkey()
+            except Exception:
+                pass
+        return super().closeEvent(ev)
+
     def toggle_play_pause(self):
         """Jednotné ovládání Play/Pause z tlačítka i klávesnice."""
-        # pokud čeká změna tempa, nejdříve ji aplikuj
-        if self._tempo_timer.isActive():
-            self._tempo_timer.stop()
-            self._apply_pending_tempo()
-            # _apply_pending_tempo po loadu a resume pustí play
-            self.playpause_btn.setChecked(True)
-            return
-
         if self.player.is_playing():
             # Pauza
             try:
@@ -424,16 +622,19 @@ class MainWindow(QMainWindow):
                 self.player.stop()
                 self.player.seek(pos)
             self.playpause_btn.setChecked(False)
+            self._user_paused = True
+            self._user_stopped = False
         else:
             # Play
             self.player.play()
             self.playpause_btn.setChecked(True)
+            self._user_paused = False
+            self._user_stopped = False
 
     def _reset_tempo(self):
         self._pending_tempo = 1.0
         self.tempo_slider.blockSignals(True); self.tempo_slider.setValue(100); self.tempo_slider.blockSignals(False)
-        self._tempo_timer.start()
-        self._update_tempo_label(pending=True)
+        self._apply_pending_tempo()
 
     def _nudge(self, delta_ms: int):
         pos_orig = self.displayed_position_ms()
@@ -515,6 +716,10 @@ class MainWindow(QMainWindow):
 
     def play_previous_in_filter(self):
         if not self._filtered_ids:
+            return
+        # 10s pravidlo: pokud jsme > 10 s ve skladbě, jen na začátek
+        if self.displayed_position_ms() > 10_000:
+            self.player.seek(0)
             return
         idx = self._index_in_filter(self._current_track_id)
         prev_idx = len(self._filtered_ids) - 1 if idx <= 0 else idx - 1
@@ -625,6 +830,8 @@ class MainWindow(QMainWindow):
             self.player.seek(0)
             self.player.play()
             self.playpause_btn.setChecked(True)  # synchronizace stavu tlačítka
+            self._user_paused = False
+            self._user_stopped = False
 
         self.player.media_loaded.connect(_resume)
         self.player.load(path, autostart=False)
@@ -756,6 +963,8 @@ class MainWindow(QMainWindow):
             if was_playing:
                 self.player.play()
                 self.playpause_btn.setChecked(True)
+                self._user_paused = False
+                self._user_stopped = False
             else:
                 self.playpause_btn.setChecked(False)
 
@@ -781,18 +990,27 @@ class MainWindow(QMainWindow):
 
     # ---------- tempo ----------
     def on_play_clicked(self):
-        """Pokud chceš mít i separátní 'Play' akci mimo toggle – zachováno kvůli kompatibilitě."""
-        if self._tempo_timer.isActive():
-            self._tempo_timer.stop()
-            self._apply_pending_tempo()
-            return
+        """Kompatibilní 'Play' akce mimo toggle – jen play."""
         self.player.play()
         self.playpause_btn.setChecked(True)
+        self._user_paused = False
+        self._user_stopped = False
 
     def on_tempo_slider_changed(self, val: int):
         self._pending_tempo = val / 100.0
-        self._update_tempo_label(pending=True)
-        self._tempo_timer.start()
+        # při táhnutí jen status, bez renderu
+        if self.tempo_slider.isSliderDown():
+            self._update_tempo_label(pending=True)
+            return
+        # klik, kolečko, šipky => hned aplikovat
+        self._apply_pending_tempo()
+
+    def _apply_pending_tempo_on_release(self):
+        # Aplikuj jen když se opravdu změnilo
+        if abs(self._pending_tempo - self._applied_tempo) < 1e-6:
+            self._update_tempo_label(pending=False)
+            return
+        self._apply_pending_tempo()
 
     def _apply_pending_tempo(self):
         if not self._original_path:
@@ -814,7 +1032,10 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Tempo render error", str(e))
 
     def _update_tempo_label(self, pending: bool):
-        if pending and abs(self._pending_tempo - self._applied_tempo) > 1e-6:
+        waiting = self.tempo_slider.isSliderDown() and (abs(self._pending_tempo - self._applied_tempo) > 1e-6)
+        if waiting:
+            self.tempo_label.setText(f"Tempo: {self._pending_tempo:.2f}x (čeká – pusť myš)")
+        elif abs(self._pending_tempo - self._applied_tempo) > 1e-6:
             self.tempo_label.setText(f"Tempo: {self._pending_tempo:.2f}x (čeká)")
         else:
             self.tempo_label.setText(f"Tempo: {self._applied_tempo:.2f}x (aplikováno)")
@@ -828,7 +1049,7 @@ class MainWindow(QMainWindow):
         self._gain_regions = []
         self._load_and_play_original(path)
 
-    # ---------- PRACTICE: poskládat WAV, přidat do knihovny a přehrát ----------
+    # ---------- PRACTICE ----------
     def _pick_length_seconds(self) -> int:
         items = ["01:30", "01:40", "02:00"]
         text, ok = QInputDialog.getItem(self, "Délka skladby", "Zvol délku každé skladby:", items, 0, True)
@@ -869,25 +1090,15 @@ class MainWindow(QMainWindow):
 
     def _find_track_for_dance(self, dance_name: str, *, use_ui_filters: bool = True,
                               used_ids: set[str] | None = None) -> tuple[str, int] | None:
-        """
-        Vrátí (path, duration_ms) NÁHODNÉ vyhovující skladby z knihovny.
-        - use_ui_filters=True => respektuje text v search boxu a „Jen oblíbené ★“.
-        - used_ids => pokud je předáno, pokusí se vyhnout už použitým ID (pro různá kola výběru).
-        """
         synonyms = {
             "samba": [r"\bsamba\b"],
             "cha cha": [r"\bcha\b.*\bcha\b", r"\bchacha\b", r"\bcha-cha\b", r"\bcha\s*cha\b"],
             "rumba": [r"\brumba\b", r"\brhumba\b"],
             "paso doble": [r"\bpaso\b.*\bdoble\b", r"\bpasodoble\b", r"\bpaso\b"],
             "jive": [r"\bjive\b"],
-            "waltz": [
-                r"(?<!viennese\s)\bwaltz\b",
-            ],
+            "waltz": [r"(?<!viennese\s)\bwaltz\b"],
             "tango": [r"\btango\b"],
-            "viennese waltz": [
-                r"\bviennese\b.*\bwaltz\b",
-                r"\bvalčík\b"
-            ],
+            "viennese waltz": [r"\bviennese\b.*\bwaltz\b", r"\bvalčík\b"],
             "slowfox": [r"\bslow\s*fox\b", r"\bslowfox\b", r"\bfoxtrot\b"],
             "quickstep": [r"\bquick\s*step\b", r"\bquickstep\b"],
         }
@@ -924,7 +1135,6 @@ class MainWindow(QMainWindow):
         if not candidates:
             return None
 
-        # pokud máme použité ID, zkus je vyloučit
         if used_ids:
             fresh = [c for c in candidates if c[0] not in used_ids]
             if fresh:
@@ -1086,6 +1296,38 @@ class MainWindow(QMainWindow):
     def _on_stop_clicked(self):
         self.player.stop()
         self.playpause_btn.setChecked(False)
+        self._user_stopped = True
+        self._user_paused = False
+
+    # ---------- AutoNext watchdog ----------
+    def _check_autonext(self):
+        # vypnuto?
+        if not self._auto_next_chk.isChecked():
+            self._was_playing = self.player.is_playing()
+            return
+
+        # pokud uživatel skladbu zastavil nebo pauznul, nespouštěj auto-next
+        if self._user_stopped or self._user_paused:
+            self._was_playing = self.player.is_playing()
+            return
+
+        playing = self.player.is_playing()
+        cur = self.player.current_position_ms()
+        dur = self.player.duration_ms() or 0
+
+        # přechod z playing -> not playing
+        if self._was_playing and not playing and dur > 0:
+            # pokud je aktivní loop, nechoď dál
+            a, b = self.timeline.loopPoints()
+            if a is None and b is None:
+                # „konec“ definujme jako dohrání minimálně do posledních 400 ms
+                if cur >= max(0, dur - 400):
+                    try:
+                        self.play_next_in_filter()
+                    except Exception:
+                        pass
+
+        self._was_playing = playing
 
 
 class PlayPauseButton(QPushButton):
