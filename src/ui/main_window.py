@@ -13,9 +13,9 @@ import numpy as np
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QFileDialog,
+    QPushButton, QLabel, QFileDialog, QDialog,
     QListWidget, QListWidgetItem, QMessageBox, QSplitter, QLineEdit, QSlider, QMenu,
-    QSizePolicy, QCheckBox, QInputDialog
+    QSizePolicy, QCheckBox, QInputDialog, QDialogButtonBox
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QPoint, QRegularExpression, QSize,
@@ -1088,6 +1088,27 @@ class MainWindow(QMainWindow):
         except Exception:
             return -1
 
+    def _get_save_type(self) -> int:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Uložit practice")
+
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel("Chceš uložit practice do knihovny?"))
+
+        cb = QCheckBox("uložit practice", dlg)
+        layout.addWidget(cb)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, parent=dlg)
+        layout.addWidget(buttons)
+
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return -1
+
+        return 1 if cb.isChecked() else 0
+
     def _find_track_for_dance(self, dance_name: str, *, use_ui_filters: bool = True,
                               used_ids: set[str] | None = None) -> tuple[str, int] | None:
         synonyms = {
@@ -1186,7 +1207,7 @@ class MainWindow(QMainWindow):
     def generate_practice_and_play(self):
         """
         Sestaví jeden WAV (Samba → Cha-cha → Rumba → Paso doble → Jive) s mezerami vyplněnými souborem obsahujícím mezihudba, nebo tichem.
-        Dočasně uloží do knihovny a ihned ho pustí jako jednu skladbu.
+        Podle volby „Uložit practice“ výsledek buď uloží do knihovny, nebo jen dočasně vyexportuje a přehraje.
         """
         type = self._pick_dance_style()
         clip_len_s = self._pick_length_seconds()
@@ -1224,7 +1245,7 @@ class MainWindow(QMainWindow):
                 missing.append(f"{d} ({os.path.basename(path)}: {e})")
 
         if not segments:
-            QMessageBox.warning(self, "Nenalezeno", "V knihovně se nenašly skladby pro Latinské tance.")
+            QMessageBox.warning(self, "Nenalezeno", "V knihovně se nenašly skladby pro zvolený practice.")
             return
 
         if missing:
@@ -1239,58 +1260,73 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Chyba mixu", str(e))
             return
 
-        # uložit do dočasné složky knihovny a přidat do Library
-        try:
-            lib_dir, _db_path = self.library.locations()
-            out_dir = os.path.join(lib_dir, "_practice_temp")
-            os.makedirs(out_dir, exist_ok=True)
+        # --- export / uložení podle checkboxu ---
+        save_to_library = self._get_save_type()
 
+        try:
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             if type == 1:
                 base_name = f"Practice_Latin_{clip_len_s}s_gap{gap_s}s_{stamp}.wav"
             else:
                 base_name = f"Practice_Standart_{clip_len_s}s_gap{gap_s}s_{stamp}.wav"
-            out_path = os.path.join(out_dir, base_name)
 
+            if save_to_library:
+                # uložit do dočasné složky knihovny a přidat do Library
+                lib_dir, _db_path = self.library.locations()
+                out_dir = os.path.join(lib_dir, "_practice_temp")
+                os.makedirs(out_dir, exist_ok=True)
+            else:
+                # jen do systémového temp adresáře, nepřidávat do knihovny
+                out_dir = tempfile.gettempdir()
+
+            out_path = os.path.join(out_dir, base_name)
             final_mix.export(out_path, format="wav")
         except Exception as e:
-            QMessageBox.critical(self, "Export dočasného WAV selhal", str(e))
+            QMessageBox.critical(self, "Export WAV selhal", str(e))
             return
 
-        # přidat do knihovny + přehrát
-        try:
-            self.library.add_file(out_path)
-        except Exception as e:
-            # fallback – přehrajeme přímo
-            self._current_track_id = None
-            self._gain_regions = []
-            self._load_and_play_original(out_path)
-            QMessageBox.warning(self, "Nelze přidat do knihovny",
-                                f"Soubor se nepodařilo zapsat do knihovny, přehrávám přímo.\n\n{e}")
-            return
-
-        try:
-            self.refresh_list(show_locations=False)
-            target_title = os.path.splitext(base_name)[0].lower()
-            track_id = None
-            for t in self.library.list_tracks():
-                if (t.title or "").lower() == target_title:
-                    track_id = t.id
-                    break
-
-            if track_id:
-                self._play_track_id(track_id)
-            else:
+        if save_to_library:
+            # přidat do knihovny + přehrát
+            try:
+                self.library.add_file(out_path)
+            except Exception as e:
+                # fallback – přehrajeme přímo
                 self._current_track_id = None
                 self._gain_regions = []
                 self._load_and_play_original(out_path)
-        except Exception:
+                QMessageBox.warning(self, "Nelze přidat do knihovny",
+                                    f"Soubor se nepodařilo zapsat do knihovny, přehrávám přímo.\n\n{e}")
+                return
+
+            try:
+                self.refresh_list(show_locations=False)
+                target_title = os.path.splitext(base_name)[0].lower()
+                track_id = None
+                for t in self.library.list_tracks():
+                    if (t.title or "").lower() == target_title:
+                        track_id = t.id
+                        break
+
+                if track_id:
+                    self._play_track_id(track_id)
+                else:
+                    self._current_track_id = None
+                    self._gain_regions = []
+                    self._load_and_play_original(out_path)
+            except Exception:
+                self._current_track_id = None
+                self._gain_regions = []
+                self._load_and_play_original(out_path)
+
+            QMessageBox.information(self, "Practice připraven",
+                                    f"Poskládaná skladba je v knihovně jako:\n{base_name}")
+        else:
+            # nepřidávat do knihovny – jen přehrát dočasný soubor
             self._current_track_id = None
             self._gain_regions = []
             self._load_and_play_original(out_path)
-
-        QMessageBox.information(self, "Practice připraven",
-                                f"Poskládaná skladba je v knihovně jako:\n{base_name}")
+            QMessageBox.information(self, "Practice připraven (dočasně)",
+                                    f"Soubor nebyl uložen do knihovny.\nCesta k dočasnému WAV:\n{out_path}")
 
     # ---------- pomocné ovládací akce ----------
     def _on_stop_clicked(self):
