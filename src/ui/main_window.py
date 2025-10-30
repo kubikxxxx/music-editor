@@ -1,35 +1,38 @@
-# src/ui/main_window.py
+# ui/main_window.py
 from __future__ import annotations
 import os
 import json
 import tempfile
 import random
 import sys
+import time
 from dataclasses import dataclass
+from ui.widgets.track_list import TrackListWidget
 from datetime import datetime
+from typing import Optional, Tuple, List
 
 import numpy as np
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog,
-    QListWidget, QListWidgetItem, QMessageBox, QSplitter, QLineEdit, QSlider, QMenu,
+    QListWidgetItem, QMessageBox, QSplitter, QLineEdit, QSlider, QMenu,
     QSizePolicy, QCheckBox, QInputDialog, QDialog, QDialogButtonBox
 )
 from PyQt6.QtCore import (
-    Qt, QTimer, QPoint, QRegularExpression, QSize,
+    Qt, QTimer, QPoint, QRegularExpression,
     QCoreApplication, QEvent
 )
-from PyQt6.QtGui import QShortcut, QKeySequence, QColor  # <- přidán QColor
+from PyQt6.QtGui import QShortcut, QKeySequence, QColor
 
 from audio.player import AudioPlayer
-from audio.processing import render_variant
+from audio.processing import render_variant  # (zůstává; tempo mixdownu teď neřešíme)
 from library.manager import Library
 from ui.timeline import TimelineWidget
 
 from ui.widgets.play_pause_button import PlayPauseButton
 from ui.widgets.win_media import WinMediaKeyFilter
-from ui.track_editor import TrackEditorWidget
+from ui.track_editor import TrackEditorWidget, Cell
 
 
 def fmt_ms(ms: int) -> str:
@@ -72,13 +75,18 @@ class MainWindow(QMainWindow):
         self._favorites_only = False
         self._load_favorites_local()
 
-        # --- transport podle aranže ---
+        # --- transport ---
         self._arr_time_ms: int = 0
         self._arr_total_ms: int = 0
         self._transport_playing: bool = False
         self._transport_timer = QTimer(self)
         self._transport_timer.setInterval(30)
         self._transport_timer.timeout.connect(self._transport_tick)
+
+        # --- mixdown cache ---
+        self._mix_sig: str = ""             # podpis aktuální aranže (pro cache)
+        self._mixdown_tmp_path: Optional[str] = None
+        self._loaded_player_path: Optional[str] = None
 
         # --- UI prvky ---
         self.open_btn = QPushButton("Open…")
@@ -117,7 +125,7 @@ class MainWindow(QMainWindow):
 
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Hledat v knihovně…")
-        self.list_widget = QListWidget()
+        self.list_widget = TrackListWidget(self)
         self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_widget.customContextMenuRequested.connect(self._show_list_context_menu)
 
@@ -127,6 +135,10 @@ class MainWindow(QMainWindow):
         self.relink_btn = QPushButton("Relink…")
         self.fav_filter_chk = QCheckBox("Jen oblíbené ★")
         self.fav_filter_chk.stateChanged.connect(self._toggle_favorites_filter)
+
+        self._last_player_resync_t = 0.0
+        self._resync_min_interval = 0.30
+        self._resync_drift_ms = 120
 
         self.info_label = QLabel("")
 
@@ -209,9 +221,11 @@ class MainWindow(QMainWindow):
         self.timeline.clearLoopRequested.connect(self.on_clear_loop)
 
         # editor -> timeline / transport
-        self.track_editor.arrangementChanged.connect(self._sync_timeline_overlays)
-        self.track_editor.offsetChanged.connect(self._on_clip_offset_changed)
-        self.track_editor.canvasDurationChanged.connect(self._on_canvas_changed)
+        self.track_editor.clipOffsetChanged.connect(self._on_clip_offset_changed)
+        self.track_editor.arrangementChanged.connect(self._on_editor_changed)   # změna aranže → přepočet + invalidace mixu
+        self.track_editor.externalFileDropped.connect(self._on_external_file_dropped)
+        self.track_editor.libraryTrackDropped.connect(self._on_library_track_dropped)
+        self.track_editor.currentCellChanged.connect(self._on_cell_selected)
 
         # ovládání
         self.open_btn.clicked.connect(self.open_file_direct)
@@ -241,7 +255,6 @@ class MainWindow(QMainWindow):
         if sys.platform.startswith("win"):
             def _do_toggle():
                 self.toggle_play_pause()
-
             self._win_media_filter = WinMediaKeyFilter(
                 on_playpause=_do_toggle, on_play=_do_toggle, on_pause=_do_toggle, debug=True
             )
@@ -360,14 +373,21 @@ class MainWindow(QMainWindow):
 
     # ---------- shortcuts / events ----------
     def _install_shortcuts(self):
-        QShortcut(QKeySequence("Space"), self, activated=self.toggle_play_pause)
-        QShortcut(QKeySequence("R"), self, activated=self._reset_tempo)
-        QShortcut(QKeySequence("Left"), self, activated=lambda: self.on_seek_requested(max(0, self._arr_time_ms - 5000)))
-        QShortcut(QKeySequence("Right"), self, activated=lambda: self.on_seek_requested(self._arr_time_ms + 5000))
-        QShortcut(QKeySequence("MediaNext"), self, activated=self.play_next_in_filter)
-        QShortcut(QKeySequence("MediaPrevious"), self, activated=self.play_previous_in_filter)
-        QShortcut(QKeySequence("F11"), self, activated=self._toggle_fullscreen)
-        QShortcut(QKeySequence("Esc"), self, activated=self._exit_fullscreen)
+        # PyQt6-safe: vytvořit QShortcut a pak připojit signál; používat Qt.Key.*
+        def mk(key, slot):
+            sc = QShortcut(QKeySequence(key), self)
+            sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            sc.activated.connect(slot)
+            return sc
+
+        mk(Qt.Key.Key_Space, self.toggle_play_pause)
+        mk(Qt.Key.Key_R, self._reset_tempo)
+        mk(Qt.Key.Key_Left, lambda: self.on_seek_requested(max(0, self._arr_time_ms - 5000)))
+        mk(Qt.Key.Key_Right, lambda: self.on_seek_requested(self._arr_time_ms + 5000))
+        mk(Qt.Key.Key_MediaNext, self.play_next_in_filter)
+        mk(Qt.Key.Key_MediaPrevious, self.play_previous_in_filter)
+        mk(Qt.Key.Key_F11, self._toggle_fullscreen)
+        mk(Qt.Key.Key_Escape, self._exit_fullscreen)
 
     def changeEvent(self, ev):
         if sys.platform.startswith("win") and ev.type() == QEvent.Type.WinIdChange:
@@ -378,6 +398,11 @@ class MainWindow(QMainWindow):
         return super().changeEvent(ev)
 
     def closeEvent(self, ev):
+        try:
+            if self._mixdown_tmp_path and os.path.isfile(self._mixdown_tmp_path):
+                os.remove(self._mixdown_tmp_path)
+        except Exception:
+            pass
         if sys.platform.startswith("win"):
             try:
                 self._win_media_filter.unregister_global_playpause_hotkey()
@@ -385,107 +410,64 @@ class MainWindow(QMainWindow):
                 pass
         return super().closeEvent(ev)
 
-    # ---------- TRANSPORT (aranž) ----------
+    # ---------- TRANSPORT ----------
     def _clip_bounds(self) -> tuple[int, int]:
-        start = self.track_editor.currentOffsetMs()
-        length = self._original_duration_ms or 0
-        return start, start + length
+        return 0, max(0, int(self._arr_total_ms))
+
+    def _on_editor_changed(self):
+        self._mix_sig = ""  # invalidace cache
+        self._recompute_total_and_overlays()
+        if self._transport_playing or self._arr_time_ms > 0:
+            cur = self._arr_time_ms
+            self._ensure_mixdown_loaded(rebuild=True)
+            self.on_seek_requested(cur)
 
     def _recompute_total_and_overlays(self):
-        """Nastav celkovou délku nahoře a šedý 'tichý' overlay před klipem."""
-        clip_a, clip_b = self._clip_bounds()
-        self._arr_total_ms = clip_b  # končí přesně na konci buňky
+        self._arr_total_ms = self.track_editor.totalDurationMs()
         self.timeline.setDuration(self._arr_total_ms)
 
-        # overlayy: ticho [0, clip_a) a klip [clip_a, clip_b)
+        wf_mix = self.track_editor.exportMixdownWaveform(buckets=3000)
+        self.timeline.setWaveform(wf_mix)
+
+        intervals = []
+        for c in getattr(self.track_editor, "_cells", []):
+            if c.duration_ms > 0:
+                intervals.append((c.offset_ms, c.offset_ms + c.duration_ms))
+        intervals.sort()
+        merged = []
+        for a, b in intervals:
+            if not merged or a > merged[-1][1]:
+                merged.append([a, b])
+            else:
+                merged[-1][1] = max(merged[-1][1], b)
+
         overlays = []
-        if clip_a > 0:
-            overlays.append({
-                "type": "region",
-                "start": 0,
-                "end": clip_a,
-                "color": QColor(120, 120, 120, 110)   # šedé ticho
-            })
-        overlays.append({
-            "type": "region",
-            "start": clip_a,
-            "end": clip_b,
-            "color": QColor(60, 200, 140, 110)       # zeleně klip
-        })
+        cur = 0
+        for a, b in merged:
+            if a > cur:
+                overlays.append({"type": "region", "start": cur, "end": a, "color": QColor(120,120,120,110)})
+            overlays.append({"type": "region", "start": a, "end": b, "color": QColor(60,200,140,110)})
+            cur = b
+        if cur < self._arr_total_ms:
+            overlays.append({"type": "region", "start": cur, "end": self._arr_total_ms, "color": QColor(120,120,120,110)})
         self.timeline.setOverlays(overlays)
 
-        # refresh labelu/pozice
         self.timeline.setPosition(min(self._arr_time_ms, self._arr_total_ms))
         self.pos_label.setText(f"{fmt_ms(self._arr_time_ms)} / {fmt_ms(self._arr_total_ms)}")
         self.timeline.update()
-        self._rebuild_arranged_waveform()
-
-    def _rebuild_arranged_waveform(self):
-        """
-        Postaví nový waveform pro horní timeline:
-        - do clip_a je ticho (0)
-        - od clip_a běží waveform zdroje přemapovaný do aranže
-        """
-        wf_src = getattr(self.track_editor, "_waveform", None)
-        src_ms = self._original_duration_ms or 0
-        total = self._arr_total_ms or 0
-        clip_a, clip_b = self._clip_bounds()
-
-        if not wf_src or src_ms <= 0 or total <= 0:
-            self.timeline.setWaveform(None)
-            return
-
-        n_src = len(wf_src)
-        # velikost výstupu – použijeme podobný počet vzorků jako zdroj (pěkně vypadá)
-        N = max(300, min(4000, n_src))
-
-        out = []
-        for i in range(N):
-            t = (i / (N - 1)) * total  # čas v aranži
-            if t < clip_a:
-                out.append(0.0)  # ticho před klipem
-                continue
-            # čas ve zdroji (od začátku klipu)
-            s = (t - clip_a) / src_ms
-            if s <= 0:
-                out.append(0.0)
-                continue
-            if s >= 1.0:
-                out.append(wf_src[-1])
-                continue
-            # lineární interpolace ve zdrojovém waveformu
-            x = s * (n_src - 1)
-            j = int(x)
-            frac = x - j
-            v0 = wf_src[j]
-            v1 = wf_src[j + 1] if j + 1 < n_src else wf_src[j]
-            out.append((1 - frac) * v0 + frac * v1)
-
-        self.timeline.setWaveform(out)
 
     def _transport_tick(self):
-        self._arr_time_ms = max(0, self._arr_time_ms + self._transport_timer.interval())
+        self._arr_time_ms = min(self._arr_time_ms + self._transport_timer.interval(), self._arr_total_ms)
         self.timeline.setPosition(min(self._arr_time_ms, self._arr_total_ms))
+        self.track_editor.setPlayhead(self._arr_time_ms)
         self.pos_label.setText(f"{fmt_ms(self._arr_time_ms)} / {fmt_ms(self._arr_total_ms)}")
 
-        clip_a, clip_b = self._clip_bounds()
-
-        if self._arr_time_ms < clip_a or self._arr_time_ms >= clip_b:
+        if self._arr_time_ms >= self._arr_total_ms:
             if self.player.is_playing():
                 self.player.stop()
-            if self._arr_time_ms >= self._arr_total_ms:
-                self._transport_playing = False
-                self._transport_timer.stop()
-                self.playpause_btn.setChecked(False)
-            return
-
-        in_clip_ms = self._arr_time_ms - clip_a
-        render_ms = int(in_clip_ms / max(1e-6, self._render_to_orig))
-        cur = self.player.current_position_ms()
-        if abs(cur - render_ms) > 35:
-            self.player.seek(render_ms)
-        if not self.player.is_playing():
-            self.player.play()
+            self._transport_playing = False
+            self._transport_timer.stop()
+            self.playpause_btn.setChecked(False)
 
     def toggle_play_pause(self):
         if self._transport_playing:
@@ -496,11 +478,13 @@ class MainWindow(QMainWindow):
             except AttributeError:
                 self.player.stop()
             self.playpause_btn.setChecked(False)
-        else:
-            self._transport_playing = True
-            self._transport_timer.start()
-            self.playpause_btn.setChecked(True)
-            self.on_seek_requested(self._arr_time_ms)
+            return
+
+        self._ensure_mixdown_loaded(rebuild=(self._mix_sig == ""))
+        self._transport_playing = True
+        self._transport_timer.start()
+        self.playpause_btn.setChecked(True)
+        self.on_seek_requested(self._arr_time_ms)
 
     def _on_stop_clicked(self):
         self._transport_playing = False
@@ -509,46 +493,115 @@ class MainWindow(QMainWindow):
         self.playpause_btn.setChecked(False)
 
     def on_seek_requested(self, ms_orig: int):
-        self._arr_time_ms = max(0, int(ms_orig))
-        clip_a, clip_b = self._clip_bounds()
-        if self._arr_time_ms < clip_a or self._arr_time_ms >= clip_b:
-            self.player.stop()
-        else:
-            in_clip_ms = self._arr_time_ms - clip_a
-            render_ms = int(in_clip_ms / max(1e-6, self._render_to_orig))
-            self.player.seek(render_ms)
+        self._arr_time_ms = max(0, min(ms_orig, self._arr_total_ms))
+        self.timeline.setPosition(self._arr_time_ms)
+        self.track_editor.setPlayhead(self._arr_time_ms)
+        self.pos_label.setText(f"{fmt_ms(self._arr_time_ms)} / {fmt_ms(self._arr_total_ms)}")
+
+        if self._loaded_player_path == (self._mixdown_tmp_path or ""):
+            self.player.seek(self._arr_time_ms)
             if self._transport_playing and not self.player.is_playing():
                 self.player.play()
-        self.timeline.setPosition(min(self._arr_time_ms, self._arr_total_ms))
-        self.pos_label.setText(f"{fmt_ms(self._arr_time_ms)} / {fmt_ms(self._arr_total_ms)}")
 
     def on_scrubbed(self, _ms_orig: int):
         pass
 
     def on_loop_a_changed(self, ms_orig: int):
-        a = None if ms_orig < 0 else int(ms_orig / max(1e-6, self._render_to_orig))
-        self.player.set_loop_ms(a=a, b=None)
+        self.player.set_loop_ms(a=None if ms_orig < 0 else int(ms_orig), b=None)
 
     def on_loop_b_changed(self, ms_orig: int):
-        b = None if ms_orig < 0 else int(ms_orig / max(1e-6, self._render_to_orig))
-        self.player.set_loop_ms(a=None, b=b)
+        self.player.set_loop_ms(a=None, b=None if ms_orig < 0 else int(ms_orig))
 
     def on_clear_loop(self):
         self.player.clear_loop()
 
-    # ---------- sync timeline & editor ----------
-    def _sync_timeline_overlays(self):
-        self._recompute_total_and_overlays()
-
-    def _on_canvas_changed(self, _total_ms: int):
-        self._recompute_total_and_overlays()
-
     def _on_clip_offset_changed(self, _start_ms: int):
-        self._recompute_total_and_overlays()
-        if self._transport_playing:
-            self.on_seek_requested(self._arr_time_ms)
+        self._on_editor_changed()
 
-    # ---------- waveform builder ----------
+    def _on_cell_selected(self, _idx: int):
+        pass
+
+    # ---------- mixdown builder ----------
+    def _arrangement_signature(self) -> str:
+        cells: List[Cell] = getattr(self.track_editor, "_cells", [])
+        parts = [f"{c.path}|{c.lane}|{c.offset_ms}|{c.duration_ms}" for c in cells]
+        parts.append(f"T:{self._applied_tempo:.5f}")
+        return "|".join(parts)
+
+    def _ensure_mixdown_loaded(self, rebuild: bool = False):
+        sig = self._arrangement_signature()
+        if (not rebuild) and sig == self._mix_sig and self._loaded_player_path == (self._mixdown_tmp_path or ""):
+            return
+
+        path = self._render_arrangement_to_temp_wav()
+        if not path:
+            return
+
+        was_playing = self._transport_playing
+        cur_ms = self._arr_time_ms
+
+        def _resume():
+            try:
+                self.player.media_loaded.disconnect(_resume)
+            except Exception:
+                pass
+            self.on_duration_changed(0)
+            self.player.seek(min(cur_ms, self.player.duration_ms()))
+            if was_playing:
+                self.player.play()
+
+        self.player.media_loaded.connect(_resume)
+        self.player.load(path, autostart=False)
+
+        self._loaded_player_path = path
+        self._mix_sig = sig
+
+    def _render_arrangement_to_temp_wav(self) -> Optional[str]:
+        try:
+            from pydub import AudioSegment
+        except Exception:
+            QMessageBox.critical(self, "Chybí pydub", "Pro mixdown je potřeba pydub a FFmpeg v PATH.")
+            return None
+
+        cells: List[Cell] = getattr(self.track_editor, "_cells", [])
+        total_ms = max(1, int(self.track_editor.totalDurationMs()))
+        if not cells:
+            return None
+
+        mix = AudioSegment.silent(duration=total_ms)
+
+        for c in cells:
+            src_path = c.path or self._original_path
+            if not src_path or not os.path.isfile(src_path):
+                continue
+            try:
+                seg = AudioSegment.from_file(src_path)
+                seg = seg[:max(0, int(c.duration_ms))]
+                if len(seg) <= 0:
+                    continue
+                off = max(0, int(c.offset_ms))
+                mix = mix.overlay(seg, position=off)
+            except Exception as e:
+                print("Mixdown segment error:", e)
+
+        try:
+            if self._mixdown_tmp_path and os.path.isfile(self._mixdown_tmp_path):
+                os.remove(self._mixdown_tmp_path)
+        except Exception:
+            pass
+
+        tmp_dir = tempfile.gettempdir()
+        out_path = os.path.join(tmp_dir, f"pm_arr_mix_{int(time.time()*1000)}_{random.randint(0, 999999)}.wav")
+        try:
+            mix.export(out_path, format="wav")
+        except Exception as e:
+            QMessageBox.critical(self, "Export mixdown selhal", str(e))
+            return None
+
+        self._mixdown_tmp_path = out_path
+        return out_path
+
+    # ---------- WAV/obálka builder pro hlavní skladbu ----------
     def _load_waveform(self, path: str, buckets: int = 1500):
         try:
             from pydub import AudioSegment
@@ -563,7 +616,7 @@ class MainWindow(QMainWindow):
                 self.track_editor.setWaveform(None, self._original_duration_ms or 0)
                 return
 
-            buckets = max(200, min(buckets, 4000))
+            buckets = max(200, min(buckets, 8000))
             step = int(np.ceil(n / buckets))
             vals = []
             for i in range(0, n, step):
@@ -575,7 +628,6 @@ class MainWindow(QMainWindow):
             self.timeline.setWaveform(wf)
             self.track_editor.setWaveform(wf, self._original_duration_ms or 0)
 
-            # reset a přepočty
             self._recompute_total_and_overlays()
             self._arr_time_ms = 0
             self.timeline.setPosition(0)
@@ -695,6 +747,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Soubor chybí",
                                     "Soubor v knihovně neexistuje. Znovu jej naimportuj (Import…).")
                 return
+        title_for_label = self._track_title_by_id(track_id) or os.path.splitext(os.path.basename(path))[0]
+        self.track_editor.setClipLabel(title_for_label)
         self._current_track_id = track_id
         self._gain_regions = []
         self._load_and_play_original(path)
@@ -719,32 +773,33 @@ class MainWindow(QMainWindow):
         except Exception:
             self._original_duration_ms = None
 
+        self.track_editor.setClipLabel(os.path.splitext(os.path.basename(path))[0])
+        self.track_editor.setSourceDuration(self._original_duration_ms or 0)
         self._load_waveform(path)
+
         self._applied_tempo = 1.0
         self._pending_tempo = 1.0
         self._update_tempo_label(pending=False)
         self.tempo_slider.blockSignals(True); self.tempo_slider.setValue(100); self.tempo_slider.blockSignals(False)
         self.timeline.setLoopPoints(None, None)
 
-        # reset času a přepočítej total+overlays
         self._arr_time_ms = 0
+        self._mix_sig = ""
         self._recompute_total_and_overlays()
 
-        def _resume():
-            try:
-                self.player.media_loaded.disconnect(_resume)
-            except Exception:
-                pass
-            self.on_duration_changed(0)
-            self.player.stop()
+        self._loaded_player_path = None
+        self.player.stop()
 
-        self.player.media_loaded.connect(_resume)
-        self.player.load(path, autostart=False)
+        # okamžitá synchronizace UI/transportu
+        self.timeline.setPosition(0)
+        self.track_editor.setPlayhead(0)
+        self.pos_label.setText(f"{fmt_ms(0)} / {fmt_ms(self._arr_total_ms)}")
 
     # ---------- tempo / render ----------
     def on_duration_changed(self, _ms_render: int):
         render_total = self.player.duration_ms() or 1
         orig_total = self._original_duration_ms or render_total
+        self.track_editor.setSourceDuration(self._original_duration_ms or 0)
         render_total = max(1, int(render_total))
         orig_total = max(1, int(orig_total))
         self._render_to_orig = orig_total / render_total
@@ -759,7 +814,7 @@ class MainWindow(QMainWindow):
     def _reset_tempo(self):
         self._pending_tempo = 1.0
         self.tempo_slider.blockSignals(True)
-        self.tempo_slider.setValue(100)  # 100 = 1.00x
+        self.tempo_slider.setValue(100)
         self.tempo_slider.blockSignals(False)
         self._apply_pending_tempo()
 
@@ -770,36 +825,8 @@ class MainWindow(QMainWindow):
         self._apply_pending_tempo()
 
     def _apply_pending_tempo(self):
-        if not self._original_path:
-            return
-        if abs(self._pending_tempo - self._applied_tempo) < 1e-6:
-            return
-
-        clip_a, _clip_b = self._clip_bounds()
-        in_clip_ms = max(0, self._arr_time_ms - clip_a)
-
-        was_playing = self._transport_playing
-        try:
-            path = render_variant(self._original_path,
-                                  tempo_factor=self._pending_tempo,
-                                  gain_regions=self._gain_regions)
-            def _resume():
-                try:
-                    self.player.media_loaded.disconnect(_resume)
-                except Exception:
-                    pass
-                self.on_duration_changed(0)
-                render_ms = int(in_clip_ms / max(1e-6, self._render_to_orig))
-                self.player.seek(min(render_ms, self.player.duration_ms()))
-                if was_playing:
-                    self.player.play()
-            self.player.media_loaded.connect(_resume)
-            self.player.load(path, autostart=False)
-
-            self._applied_tempo = self._pending_tempo
-            self._update_tempo_label(pending=False)
-        except Exception as e:
-            QMessageBox.critical(self, "Tempo render error", str(e))
+        self._applied_tempo = self._pending_tempo
+        self._update_tempo_label(pending=False)
 
     def _update_tempo_label(self, pending: bool):
         waiting = self.tempo_slider.isSliderDown() and (abs(self._pending_tempo - self._applied_tempo) > 1e-6)
@@ -810,14 +837,6 @@ class MainWindow(QMainWindow):
         else:
             self.tempo_label.setText(f"Tempo: {self._applied_tempo:.2f}x (aplikováno)")
 
-    # ---------- fullscreen/nudge ----------
-    def _toggle_fullscreen(self):
-        self.showMaximized() if self.isFullScreen() else self.showFullScreen()
-
-    def _exit_fullscreen(self):
-        if self.isFullScreen():
-            self.showMaximized()
-
     # ---------- Open ----------
     def open_file_direct(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open audio (bez uložení do knihovny)", "", "Audio (*.mp3 *.wav *.flac)")
@@ -825,10 +844,31 @@ class MainWindow(QMainWindow):
             return
         self._current_track_id = None
         self._gain_regions = []
+        self.track_editor.setClipLabel(os.path.splitext(os.path.basename(path))[0])
         self._load_and_play_original(path)
 
+    # ---------- DnD z editoru ----------
+    def _on_external_file_dropped(self, path: str, lane: int, offset_ms: int):
+        wf, dur = self._make_waveform_for_path(path, buckets=8000)
+        title = os.path.splitext(os.path.basename(path))[0]
+        if not wf or dur <= 0:
+            QMessageBox.warning(self, "Soubor", "Nepodařilo se načíst zvuk (nepodporovaný?).")
+            return
+        self.track_editor.addCellWithWaveform(path, title, lane, offset_ms, dur, wf)
+
+    def _on_library_track_dropped(self, track_id: str, lane: int, offset_ms: int):
+        path = self.library.get_track_path(track_id)
+        if not path or not os.path.isfile(path):
+            QMessageBox.warning(self, "Knihovna", "Soubor v knihovně chybí.")
+            return
+        title = self._track_title_by_id(track_id) or os.path.splitext(os.path.basename(path))[0]
+        wf, dur = self._make_waveform_for_path(path, buckets=8000)
+        if not wf or dur <= 0:
+            QMessageBox.warning(self, "Knihovna", "Nepodařilo se načíst zvuk.")
+            return
+        self.track_editor.addCellWithWaveform(path, title, lane, offset_ms, dur, wf)
+
     # ---------- PRACTICE ----------
-    # (beze změn proti tvé poslední verzi – ponechávám celý kód)
     def _pick_length_seconds(self) -> int:
         items = ["01:30", "01:40", "02:00"]
         text, ok = QInputDialog.getItem(self, "Délka skladby", "Zvol délku každé skladby:", items, 0, True)
@@ -883,7 +923,7 @@ class MainWindow(QMainWindow):
         return 1 if cb.isChecked() else 0
 
     def _find_track_for_dance(self, dance_name: str, *, use_ui_filters: bool = True,
-                              used_ids: set[str] | None = None) -> tuple[str, int] | None:
+                              used_ids: set[str] | None = None) -> Optional[Tuple[str, int]]:
         synonyms = {
             "samba": [r"\bsamba\b"],
             "cha cha": [r"\bcha\b.*\bcha\b", r"\bchacha\b", r"\bcha-cha\b", r"\bcha\s*cha\b"],
@@ -902,7 +942,7 @@ class MainWindow(QMainWindow):
         query = (self.search_edit.text() or "").strip().lower() if use_ui_filters else ""
         fav_only = self._favorites_only if use_ui_filters else False
 
-        candidates: list[tuple[str, str, int]] = []
+        candidates: List[Tuple[str, str, int]] = []
 
         try:
             tracks = self.library.list_tracks()
@@ -951,7 +991,7 @@ class MainWindow(QMainWindow):
             print(f"Chyba při hledání mezihudby: {e}")
         return AudioSegment.silent(duration=duration_ms)
 
-    def _load_clip(self, path: str, clip_seconds: int, dance):
+    def _load_clip(self, path: str, clip_seconds: int, dance: str):
         from pydub import AudioSegment
         seg = AudioSegment.from_file(path)
         need_ms = max(1000, int(clip_seconds * 1000))
@@ -980,8 +1020,9 @@ class MainWindow(QMainWindow):
         segments: list[AudioSegment] = []
         missing: list[str] = []
 
+        used_ids: set[str] = set()
         for d in dances:
-            found = self._find_track_for_dance(d)
+            found = self._find_track_for_dance(d, used_ids=used_ids)
             if not found:
                 missing.append(d); continue
             path, _dur_ms = found
@@ -1031,6 +1072,7 @@ class MainWindow(QMainWindow):
             try:
                 self.library.add_file(out_path)
             except Exception as e:
+                # nepodařilo se zapsat do DB – aspoň přehraj přímo
                 self._current_track_id = None
                 self._gain_regions = []
                 self._load_and_play_original(out_path)
@@ -1075,3 +1117,54 @@ class MainWindow(QMainWindow):
                 self.play_next_in_filter()
             except Exception:
                 pass
+
+    def _arr_time_from_player(self) -> int:
+        return self._arr_time_ms
+
+    def _track_title_by_id(self, track_id: str) -> str:
+        try:
+            for t in self.library.list_tracks():
+                if t.id == track_id:
+                    return (t.title or "").strip()
+        except Exception:
+            pass
+        return ""
+
+    def _make_waveform_for_path(self, path: str, buckets: int = 8000) -> tuple[list[float] | None, int]:
+        try:
+            from pydub import AudioSegment
+            seg = AudioSegment.from_file(path).set_channels(1)
+            duration_ms = int(len(seg))
+            sw = seg.sample_width
+            max_val = float(1 << (8 * sw - 1))
+            import numpy as np
+            arr = np.array(seg.get_array_of_samples(), dtype=np.float32) / max_val
+            if len(arr) == 0:
+                return None, duration_ms
+            buckets = max(400, min(buckets, 20000))
+            step = int(np.ceil(len(arr) / buckets))
+            vals = []
+            for i in range(0, len(arr), step):
+                chunk = arr[i:i + step]
+                rms = float(np.sqrt((chunk * chunk).mean())) if len(chunk) else 0.0
+                vals.append(rms)
+            m = max(vals) if vals else 1.0
+            wf = None if m <= 0 else [v / m for v in vals]
+            return wf, duration_ms
+        except Exception:
+            return None, 0
+
+    def _toggle_fullscreen(self):
+        """Přepne okno mezi fullscreen a normálním režimem."""
+        if not hasattr(self, "_normal_geometry"):
+            self._normal_geometry = None
+
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+
+    def _exit_fullscreen(self):
+        """Opustí fullscreen, pokud v něm zrovna jsme."""
+        if self.isFullScreen():
+            self.showNormal()
