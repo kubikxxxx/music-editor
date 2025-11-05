@@ -4,10 +4,9 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="563ca7a4-b125-41c9-b2b5-90b60074cc9d" name="Changes" comment="funkční tempo pro každou buňku editoru zvlášť">
+    <list default="true" id="563ca7a4-b125-41c9-b2b5-90b60074cc9d" name="Changes" comment="optimalizace/plynulost">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/ui/main_window.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/main_window.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/ui/track_editor.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/track_editor.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/ui/widgets/track_list.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/widgets/track_list.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -176,7 +175,15 @@
       <option name="project" value="LOCAL" />
       <updated>1762349904978</updated>
     </task>
-    <option name="localTasksCounter" value="8" />
+    <task id="LOCAL-00008" summary="optimalizace/plynulost">
+      <option name="closed" value="true" />
+      <created>1762369240227</created>
+      <option name="number" value="00008" />
+      <option name="presentableId" value="LOCAL-00008" />
+      <option name="project" value="LOCAL" />
+      <updated>1762369240227</updated>
+    </task>
+    <option name="localTasksCounter" value="9" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -202,7 +209,8 @@
     <MESSAGE value="přidání možnosti practicu STT" />
     <MESSAGE value="alespoň trochu funkční &quot;editor&quot;" />
     <MESSAGE value="funkční tempo pro každou buňku editoru zvlášť" />
-    <option name="LAST_COMMIT_MESSAGE" value="funkční tempo pro každou buňku editoru zvlášť" />
+    <MESSAGE value="optimalizace/plynulost" />
+    <option name="LAST_COMMIT_MESSAGE" value="optimalizace/plynulost" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/music_editor$app.coverage" NAME="app Coverage Results" MODIFIED="1758724513729" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src" />
