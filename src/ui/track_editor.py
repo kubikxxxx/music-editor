@@ -20,7 +20,9 @@ class Cell:
     duration_ms: int
     path: str
     title: str = ""
-    waveform: Optional[List[float]] = None  # 0..1 obálka pro tuhle buňku
+    waveform: Optional[List[float]] = None
+    natural_ms: int = 0
+    tempo: float = 1.0
 
 
 class TrackEditorWidget(QAbstractScrollArea):
@@ -114,6 +116,8 @@ class TrackEditorWidget(QAbstractScrollArea):
         if self._cells and self._cells[0].waveform is None:
             self._cells[0].waveform = self._waveform
             self._cells[0].duration_ms = self._source_duration_ms
+            self._cells[0].natural_ms = self._source_duration_ms
+            self._cells[0].tempo = 1.0
         self.update()
 
     def setSourceDuration(self, ms: int) -> None:
@@ -134,6 +138,21 @@ class TrackEditorWidget(QAbstractScrollArea):
             idx = max(0, min(idx, len(self._cells) - 1))
             return int(self._cells[idx].offset_ms)
         return 0
+
+    def currentCellTempo(self) -> float:
+        c = self.currentCell()
+        return 1.0 if c is None else float(c.tempo or 1.0)
+
+    def setCurrentCellTempo(self, tempo: float) -> None:
+        c = self.currentCell()
+        if not c:
+            return
+        tempo = max(0.25, min(4.0, float(tempo)))  # rozumné limity
+        c.tempo = tempo
+        base = max(1, int(c.natural_ms or c.duration_ms or 1))
+        c.duration_ms = max(1, int(round(base / max(1e-6, tempo))))
+        self.arrangementChanged.emit()
+        self.viewport().update()
 
     # ---- nové helpery pro MainWindow ----
     def currentCell(self) -> Optional[Cell]:
@@ -178,18 +197,36 @@ class TrackEditorWidget(QAbstractScrollArea):
         if not title or not title.strip():
             title = os.path.splitext(os.path.basename(path))[0]
         lane = max(0, min(self._lane_count - 1, int(lane)))
+        base_ms = max(1, int(duration_ms))
         cell = Cell(
             lane=lane,
             offset_ms=max(0, int(offset_ms)),
-            duration_ms=max(1, int(duration_ms)),
+            duration_ms=base_ms,
             path=path,
             title=title,
             waveform=(waveform[:] if waveform else None),
+            natural_ms=base_ms,
+            tempo=1.0,
         )
         self._cells.append(cell)
         self._current_cell_index = len(self._cells) - 1
         self.arrangementChanged.emit()
         self.currentCellChanged.emit(self._current_cell_index)
+        self.viewport().update()
+
+    def currentCellTempo(self) -> float:
+        c = self.currentCell()
+        return 1.0 if c is None else float(c.tempo or 1.0)
+
+    def setCurrentCellTempo(self, tempo: float) -> None:
+        c = self.currentCell()
+        if not c:
+            return
+        tempo = max(0.25, min(4.0, float(tempo)))  # limity 0.25x–4.0x
+        c.tempo = tempo
+        base = max(1, int(c.natural_ms or c.duration_ms or 1))
+        c.duration_ms = max(1, int(round(base / max(1e-6, tempo))))
+        self.arrangementChanged.emit()
         self.viewport().update()
 
     def totalDurationMs(self) -> int:
@@ -240,6 +277,8 @@ class TrackEditorWidget(QAbstractScrollArea):
                 path="",
                 title=title,
                 waveform=(self._waveform[:] if self._waveform else None),
+                natural_ms=self._source_duration_ms,
+                tempo=1.0,
             ))
             self._current_cell_index = 0
             self._pending_label_for_next_cell = None

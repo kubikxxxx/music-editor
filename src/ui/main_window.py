@@ -92,6 +92,9 @@ class MainWindow(QMainWindow):
         self._mixdown_tmp_path: Optional[str] = None
         self._loaded_player_path: Optional[str] = None
 
+        self._tempo_cache: dict[tuple[str, float], str] = {}
+        self._tempo_tmp_paths: set[str] = set()
+
         # --- UI prvky ---
         self.open_btn = QPushButton("Open…")
         self.open_btn.setStyleSheet(self._purple_btn_css())
@@ -370,6 +373,7 @@ class MainWindow(QMainWindow):
                 self.refresh_list(show_locations=False)
             elif chosen == act_play:
                 self._play_track_id(track_id)
+                self._start_playback()
         else:
             act_reload = menu.addAction("Obnovit seznam")
             chosen = menu.exec(self.list_widget.mapToGlobal(pos))
@@ -548,6 +552,25 @@ class MainWindow(QMainWindow):
         self.track_editor.setPlayhead(0)
         self.pos_label.setText(f"{fmt_ms(0)} / {fmt_ms(self._arr_total_ms)}")
 
+    def _start_playback(self):
+        """Spustí přehrávání od aktuální pozice a rozběhne UI čas."""
+        self._transport_playing = True
+        self.playpause_btn.setChecked(True)
+
+        # zajisti audio/mixdown
+        self._ensure_mixdown_loaded(rebuild=(self._mix_sig == ""))
+
+        # pokud už je nahráno, okamžitě spusť
+        if self._loaded_player_path == (self._mixdown_tmp_path or ""):
+            self.player.seek(self._arr_time_ms)
+            if not self.player.is_playing():
+                self.player.play()
+
+        # ukotvi 1:1 čas a rozběhni tick
+        self._t0_monotonic = time.monotonic()
+        self._t_anchor_ms = self._arr_time_ms
+        self._transport_timer.start()
+
     def on_seek_requested(self, ms_orig: int):
         self._arr_time_ms = max(0, min(ms_orig, self._arr_total_ms))
         self.timeline.setPosition(self._arr_time_ms)
@@ -578,13 +601,21 @@ class MainWindow(QMainWindow):
         self._on_editor_changed()
 
     def _on_cell_selected(self, _idx: int):
-        pass
+        """Synchronizuje tempo-slider s právě vybranou buňkou."""
+        t = float(self.track_editor.currentCellTempo())
+        self._applied_tempo = self._pending_tempo = t
+        self.tempo_slider.blockSignals(True)
+        self.tempo_slider.setValue(int(round(t * 100)))
+        self.tempo_slider.blockSignals(False)
+        self._update_tempo_label(pending=False)
 
     # ---------- mixdown builder ----------
     def _arrangement_signature(self) -> str:
         cells: List[Cell] = getattr(self.track_editor, "_cells", [])
-        parts = [f"{c.path}|{c.lane}|{c.offset_ms}|{c.duration_ms}" for c in cells]
-        parts.append(f"T:{self._applied_tempo:.5f}")
+        parts = [
+            f"{c.path}|{c.lane}|{c.offset_ms}|{getattr(c, 'natural_ms', c.duration_ms)}|tempo={getattr(c, 'tempo', 1.0):.5f}"
+            for c in cells
+        ]
         return "|".join(parts)
 
     def _ensure_mixdown_loaded(self, rebuild: bool = False):
@@ -632,16 +663,17 @@ class MainWindow(QMainWindow):
         mix = AudioSegment.silent(duration=total_ms)
 
         for c in cells:
-            src_path = c.path or (self._tempo_tmp_path or self._original_path)
-            if not src_path or not os.path.isfile(src_path):
+            src_orig = c.path or self._original_path
+            if not src_orig or not os.path.isfile(src_orig):
                 continue
+            tempo = float(getattr(c, "tempo", 1.0))
+            src_path = self._get_tempo_variant(src_orig, tempo) if abs(tempo - 1.0) > 1e-6 else src_orig
             try:
                 seg = AudioSegment.from_file(src_path)
                 seg = seg[:max(0, int(c.duration_ms))]
                 if len(seg) <= 0:
                     continue
-                off = max(0, int(c.offset_ms))
-                mix = mix.overlay(seg, position=off)
+                mix = mix.overlay(seg, position=max(0, int(c.offset_ms)))
             except Exception as e:
                 print("Mixdown segment error:", e)
 
@@ -652,7 +684,7 @@ class MainWindow(QMainWindow):
             pass
 
         tmp_dir = tempfile.gettempdir()
-        out_path = os.path.join(tmp_dir, f"pm_arr_mix_{int(time.time()*1000)}_{random.randint(0, 999999)}.wav")
+        out_path = os.path.join(tmp_dir, f"pm_arr_mix_{int(time.time() * 1000)}_{random.randint(0, 999999)}.wav")
         try:
             mix.export(out_path, format="wav")
         except Exception as e:
@@ -730,22 +762,29 @@ class MainWindow(QMainWindow):
         except ValueError:
             return -1
 
-    def play_next_in_filter(self):
+    def play_next_in_filter(self, *, force_play: bool = False):
         if not self._filtered_ids:
             return
         idx = self._index_in_filter(self._current_track_id)
         next_idx = 0 if idx < 0 or idx + 1 >= len(self._filtered_ids) else idx + 1
         self._play_track_id(self._filtered_ids[next_idx])
 
-    def play_previous_in_filter(self):
+        # pokud už něco hrálo, pokračuj plynule; případně vynuceně (autoplay)
+        if force_play or self._transport_playing:
+            self._start_playback()
+
+    def play_previous_in_filter(self, *, force_play: bool = False):
         if not self._filtered_ids:
             return
-        if self._arr_time_ms > 10_000:
+        # při pauznutém „replay“ chování ponecháme návrat na začátek
+        if not force_play and not self._transport_playing and self._arr_time_ms > 10_000:
             self.on_seek_requested(0)
             return
         idx = self._index_in_filter(self._current_track_id)
         prev_idx = len(self._filtered_ids) - 1 if idx <= 0 else idx - 1
         self._play_track_id(self._filtered_ids[prev_idx])
+        if force_play or self._transport_playing:
+            self._start_playback()
 
     # ---------- integrita ----------
     def repair_if_needed(self):
@@ -820,12 +859,31 @@ class MainWindow(QMainWindow):
                 self.list_widget.setCurrentItem(it)
                 break
 
+    def _get_tempo_variant(self, src_path: str, tempo: float) -> str:
+        """Vrátí cestu k WAV s upraveným tempem (cache podle src+tempo)."""
+        key = (os.path.abspath(src_path), round(float(tempo), 5))
+        cached = self._tempo_cache.get(key)
+        if cached and os.path.isfile(cached):
+            return cached
+        try:
+            try:
+                out_path = render_variant(src_path, tempo=tempo)
+            except TypeError:
+                out_path = render_variant(src_path, tempo)  # starší signatura
+        except Exception as e:
+            QMessageBox.critical(self, "Tempo", f"Nepodařilo se vytvořit tempo-variantu:\n{e}")
+            return src_path
+        self._tempo_cache[key] = out_path
+        self._tempo_tmp_paths.add(out_path)
+        return out_path
+
     def play_selected(self):
         item = self.list_widget.currentItem()
         if not item:
             return
         track_id = item.data(Qt.ItemDataRole.UserRole)
         self._play_track_id(track_id)
+        self._start_playback()
 
     def _load_and_play_original(self, path: str):
         self._cleanup_tempo_tmp()
@@ -893,18 +951,33 @@ class MainWindow(QMainWindow):
         self._apply_pending_tempo()
 
     def _apply_pending_tempo(self):
-        self._applied_tempo = float(self._pending_tempo)
+        """Aplikuje tempo na AKTUÁLNÍ buňku (přepočet z originálu),
+        přerenderuje mixdown, zachová pozici a 1:1 čas."""
+        rate = float(self._pending_tempo)
+        self._applied_tempo = rate
+
+        # změň tempo jen u vybrané buňky (přepočítá duration_ms z natural_ms)
+        self.track_editor.setCurrentCellTempo(rate)
         self._update_tempo_label(pending=False)
-        self._apply_player_rate_or_render()
+
+        # rebuild mixu se zachováním stavu
+        was_playing = self._transport_playing
+        cur_ms = self._arr_time_ms
+        self._mix_sig = ""
+        self._ensure_mixdown_loaded(rebuild=True)
+        self.on_seek_requested(min(cur_ms, self._arr_total_ms))
+        if was_playing and not self.player.is_playing():
+            self.player.play()
+        if self._transport_playing:
+            self._t0_monotonic = time.monotonic()
+            self._t_anchor_ms = self._arr_time_ms
 
     def _update_tempo_label(self, pending: bool):
-        waiting = self.tempo_slider.isSliderDown() and (abs(self._pending_tempo - self._applied_tempo) > 1e-6)
-        if waiting:
-            self.tempo_label.setText(f"Tempo: {self._pending_tempo:.2f}x (čeká – pusť myš)")
-        elif abs(self._pending_tempo - self._applied_tempo) > 1e-6:
-            self.tempo_label.setText(f"Tempo: {self._pending_tempo:.2f}x (čeká)")
+        val = self._pending_tempo if (pending and self.tempo_slider.isSliderDown()) else self._applied_tempo
+        if pending and self.tempo_slider.isSliderDown():
+            self.tempo_label.setText(f"Tempo (buňka): {val:.2f}x (čeká – pusť myš)")
         else:
-            self.tempo_label.setText(f"Tempo: {self._applied_tempo:.2f}x (aplikováno)")
+            self.tempo_label.setText(f"Tempo (buňka): {val:.2f}x (aplikováno)")
 
     # ---------- Open ----------
     def open_file_direct(self):
@@ -1097,6 +1170,7 @@ class MainWindow(QMainWindow):
             path, _dur_ms = found
             try:
                 clip = self._load_clip(path, clip_len_s, d)
+                clip = self._normalize_loudness(clip, target_lufs=-16.0)
                 segments.append(clip)
                 if gap_s > 0 and d != dances[-1]:
                     segments.append(self._make_gap_segment(gap_s))
@@ -1181,9 +1255,10 @@ class MainWindow(QMainWindow):
     def _check_autonext(self):
         if not self._auto_next_chk.isChecked():
             return
-        if not self._transport_playing and self._arr_time_ms >= self._arr_total_ms and self._filtered_ids:
+        # Dohráno a nic nehraje → přehraj další
+        if (not self._transport_playing) and self._arr_time_ms >= self._arr_total_ms and self._filtered_ids:
             try:
-                self.play_next_in_filter()
+                self.play_next_in_filter(force_play=True)
             except Exception:
                 pass
 
@@ -1240,12 +1315,17 @@ class MainWindow(QMainWindow):
 
     def _cleanup_tempo_tmp(self):
         try:
-            if self._tempo_tmp_path and os.path.isfile(self._tempo_tmp_path):
-                if self._tempo_tmp_path != (self._mixdown_tmp_path or ""):
-                    os.remove(self._tempo_tmp_path)
+            for p in list(self._tempo_tmp_paths):
+                try:
+                    if os.path.isfile(p) and p != (self._mixdown_tmp_path or ""):
+                        os.remove(p)
+                except Exception:
+                    pass
+                finally:
+                    self._tempo_tmp_paths.discard(p)
         except Exception:
             pass
-        self._tempo_tmp_path = None
+        self._tempo_cache.clear()
 
     def _apply_player_rate_or_render(self):
         """Tempo vždy vyrenderuj z originálu a pak přenačti přehrávání/mixdown."""
@@ -1299,3 +1379,48 @@ class MainWindow(QMainWindow):
         if self._transport_playing:
             self._t0_monotonic = time.monotonic()
             self._t_anchor_ms = self._arr_time_ms
+
+    def _normalize_loudness(self, seg, *, target_lufs=-16.0, true_peak_limit_db=-1.0):
+        """
+        Vrátí segment srovnaný na jednotnou hlasitost.
+        1) Preferuje EBU R128 (pyloudnorm), jinak 2) fallback na dBFS (RMS) s headroomem.
+        """
+        # 1) EBU R128 (pokud je knihovna k dispozici)
+        try:
+            import pyloudnorm as pyln
+            import numpy as _np
+
+            # pydub -> float32 (-1..1), shape: (n,) nebo (n, channels)
+            arr = _np.array(seg.get_array_of_samples()).astype(_np.float32)
+            peak = float(1 << (8 * seg.sample_width - 1))
+            arr = arr / peak
+            if seg.channels > 1:
+                arr = arr.reshape((-1, seg.channels))
+
+            meter = pyln.Meter(seg.frame_rate)  # EBU R128
+            lufs = meter.integrated_loudness(arr)
+            gain_db = target_lufs - lufs
+            seg = seg.apply_gain(gain_db)
+
+            # omez true-peak, ať nic neclipuje (ponecháme ~ -1 dBFS)
+            try:
+                allowed_boost = true_peak_limit_db - seg.max_dBFS  # (-1) - (aktuální peak)
+                if allowed_boost < 0:
+                    seg = seg.apply_gain(allowed_boost)  # záporný – lehce stáhneme
+            except Exception:
+                pass
+            return seg
+        except Exception:
+            pass
+
+        # 2) Fallback: jednoduché RMS srovnání na cílové dBFS
+        target_dbfs = -16.0  # přibližně odpovídá -16 LUFS pro pop/EDM
+        gain_db = target_dbfs - seg.dBFS
+        # pohlídej headroom (true peak ~ -1 dBFS)
+        try:
+            allowed_boost = true_peak_limit_db - seg.max_dBFS  # např. -1 - (-3.2) = +2.2 dB
+            if gain_db > allowed_boost:
+                gain_db = allowed_boost
+        except Exception:
+            pass
+        return seg.apply_gain(gain_db)
