@@ -150,6 +150,7 @@ class MainWindow(QMainWindow):
         self.info_label = QLabel("")
 
         self._tempo_tmp_path: Optional[str] = None
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # levý panel
@@ -216,6 +217,7 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.addWidget(splitter)
         self.setCentralWidget(root)
+        self.track_editor.loopRangeChanged.connect(self._on_editor_loop_changed)
 
         # player
         self.player = AudioPlayer()
@@ -388,6 +390,10 @@ class MainWindow(QMainWindow):
             sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
             sc.activated.connect(slot)
             return sc
+        mk(Qt.Key.Key_L, self._mark_loop_start)
+        sc_end = QShortcut(QKeySequence("Shift+L"), self)
+        sc_end.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        sc_end.activated.connect(self._mark_loop_end)
 
         mk(Qt.Key.Key_Space, self.toggle_play_pause)
         mk(Qt.Key.Key_R, self._reset_tempo)
@@ -473,16 +479,41 @@ class MainWindow(QMainWindow):
         if not self._transport_playing or self._t0_monotonic is None:
             return
 
-        elapsed_ms = int((time.monotonic() - self._t0_monotonic) * 1000.0)
-        new_ms = min(self._t_anchor_ms + max(0, elapsed_ms), self._arr_total_ms)
+        # 1) Preferuj skutečnou pozici z přehrávače (umí-li ji dát)
+        pos = self._player_position_ms()
+        if pos is not None:
+            new_ms = min(max(0, int(pos)), self._arr_total_ms)
+        else:
+            # 2) Fallback: náš vlastní kotvený čas
+            elapsed_ms = int((time.monotonic() - self._t0_monotonic) * 1000.0)
+            new_ms = min(self._t_anchor_ms + max(0, elapsed_ms), self._arr_total_ms)
 
+        # 3) Pokud je aktivní A/B loop, obal UI playhead při přeletu přes B
+        a, b = self.track_editor.currentLoop()
+        if a is not None and b is not None and b > a:
+            if new_ms >= b:
+                loop_len = b - a
+                overflow = new_ms - b
+                new_ms = a + (overflow % max(1, loop_len))
+
+                # znovu ukotvi čas, ať UI nepřetéká dál
+                self._t0_monotonic = time.monotonic()
+                self._t_anchor_ms = new_ms
+
+                # pokud nečteme reálnou pozici z přehrávače, srovnej i audio
+                if pos is None:
+                    self.player.seek(new_ms)
+                    if self._transport_playing and not self.player.is_playing():
+                        self.player.play()
+
+        # 4) Propis do UI
         self._arr_time_ms = new_ms
         self.timeline.setPosition(new_ms)
         self.track_editor.setPlayhead(new_ms)
         self.pos_label.setText(f"{fmt_ms(new_ms)} / {fmt_ms(self._arr_total_ms)}")
 
-        if new_ms >= self._arr_total_ms:
-            # konec aranže
+        # 5) Konec aranže řeš jen když není loop
+        if (a is None or b is None) and new_ms >= self._arr_total_ms:
             if self.player.is_playing():
                 self.player.stop()
             self._transport_playing = False
@@ -589,13 +620,19 @@ class MainWindow(QMainWindow):
         pass
 
     def on_loop_a_changed(self, ms_orig: int):
-        self.player.set_loop_ms(a=None if ms_orig < 0 else int(ms_orig), b=None)
+        a = None if ms_orig < 0 else int(ms_orig)
+        cur_a, cur_b = self.track_editor.currentLoop()
+        b = cur_b
+        self.track_editor.setLoopPoints(a, b)
 
     def on_loop_b_changed(self, ms_orig: int):
-        self.player.set_loop_ms(a=None, b=None if ms_orig < 0 else int(ms_orig))
+        b = None if ms_orig < 0 else int(ms_orig)
+        cur_a, cur_b = self.track_editor.currentLoop()
+        a = cur_a
+        self.track_editor.setLoopPoints(a, b)
 
     def on_clear_loop(self):
-        self.player.clear_loop()
+        self.track_editor.clearLoop()
 
     def _on_clip_offset_changed(self, _start_ms: int):
         self._on_editor_changed()
@@ -1424,3 +1461,39 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         return seg.apply_gain(gain_db)
+
+    def _on_editor_loop_changed(self, a_ms: int, b_ms: int):
+        """Editor nahlásil změnu loopu → promítnout do přehrávače i timeline."""
+        if a_ms < 0 or b_ms < 0:
+            self.player.clear_loop()
+            try:
+                self.timeline.setLoopPoints(None, None)
+            except Exception:
+                pass
+            return
+
+        a = int(a_ms);
+        b = int(b_ms)
+        if b < a:
+            a, b = b, a
+        self.player.set_loop_ms(a=a, b=b)
+        try:
+            self.timeline.setLoopPoints(a, b)
+        except Exception:
+            pass
+
+    def _mark_loop_start(self):
+        """Klávesa L – nastav A na aktuální playhead."""
+        a = self._arr_time_ms
+        _, b = self.track_editor.currentLoop()
+        if b is None:
+            b = a  # vytvoř minimální platný rozsah
+        self.track_editor.setLoopPoints(a, b)
+
+    def _mark_loop_end(self):
+        """Shift+L – nastav B na aktuální playhead."""
+        a, _ = self.track_editor.currentLoop()
+        b = self._arr_time_ms
+        if a is None:
+            a = b
+        self.track_editor.setLoopPoints(a, b)

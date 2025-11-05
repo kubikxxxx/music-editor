@@ -44,6 +44,7 @@ class TrackEditorWidget(QAbstractScrollArea):
     externalFileDropped = pyqtSignal(str, int, int)
     libraryTrackDropped = pyqtSignal(str, int, int)
     currentCellChanged = pyqtSignal(int)
+    loopRangeChanged = pyqtSignal(int, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -107,7 +108,13 @@ class TrackEditorWidget(QAbstractScrollArea):
 
         self._update_scrollbars()
 
-    # ---------- veřejné API ----------
+
+        self._loop_a_ms: Optional[int] = None
+        self._loop_b_ms: Optional[int] = None
+        self._loop_dragging: Optional[str] = None  # 'A' | 'B' | 'region' | None
+        self._loop_drag_anchor_ms: int = 0
+
+        # ---------- veřejné API ----------
     def setWaveform(self, wf: Optional[List[float]], duration_ms: int) -> None:
         self._waveform = wf[:] if wf else None
         self._source_duration_ms = max(0, int(duration_ms or 0))
@@ -427,6 +434,7 @@ class TrackEditorWidget(QAbstractScrollArea):
             wf = c.waveform
             if wf and c.duration_ms > 0:
                 self._draw_smooth_waveform(p, r, wf)
+        self._paint_loop(p, cr)
 
         # playhead
         phx = self._ms_to_x(self._playhead_ms)
@@ -473,6 +481,8 @@ class TrackEditorWidget(QAbstractScrollArea):
 
     # ---------- myš ----------
     def mousePressEvent(self, e: QMouseEvent) -> None:
+        if self._handle_loop_mousePress(e):
+            return
         if e.button() != Qt.MouseButton.LeftButton:
             return
         pos = e.position()
@@ -492,6 +502,8 @@ class TrackEditorWidget(QAbstractScrollArea):
         self.viewport().update()
 
     def mouseMoveEvent(self, e: QMouseEvent) -> None:
+        if self._handle_loop_mouseMove(e):
+            return
         pos = e.position()
         if self._dragging and self._drag_cell_index is not None:
             dx = pos.x() - self._drag_x_start
@@ -520,6 +532,8 @@ class TrackEditorWidget(QAbstractScrollArea):
                 self.viewport().unsetCursor()
 
     def mouseReleaseEvent(self, e: QMouseEvent) -> None:
+        if self._handle_loop_mouseRelease(e):
+            return
         if e.button() == Qt.MouseButton.LeftButton and self._dragging:
             self._dragging = False
             self._drag_cell_index = None
@@ -639,3 +653,149 @@ class TrackEditorWidget(QAbstractScrollArea):
         self.arrangementChanged.emit()
         self._update_scrollbars()
         self.viewport().update()
+
+    def setLoopPoints(self, a_ms: Optional[int], b_ms: Optional[int]) -> None:
+        """Nastaví A/B body v ms (None nebo <0 = zrušit). Emituje loopRangeChanged."""
+        if a_ms is None or b_ms is None or a_ms < 0 or b_ms < 0:
+            self._loop_a_ms = None
+            self._loop_b_ms = None
+            self.viewport().update()
+            self.loopRangeChanged.emit(-1, -1)
+            return
+
+        a = max(0, int(a_ms))
+        b = max(0, int(b_ms))
+        if b < a:
+            a, b = b, a
+
+        total = max(0, int(self.totalDurationMs()))
+        if total > 0:
+            a = min(a, total)
+            b = min(b, total)
+
+        changed = (a != self._loop_a_ms) or (b != self._loop_b_ms)
+        self._loop_a_ms, self._loop_b_ms = a, b
+        if changed:
+            self.viewport().update()
+            self.loopRangeChanged.emit(int(self._loop_a_ms), int(self._loop_b_ms))
+
+    def clearLoop(self) -> None:
+        """Zruší loop (emit -1, -1)."""
+        if self._loop_a_ms is None and self._loop_b_ms is None:
+            return
+        self._loop_a_ms = None
+        self._loop_b_ms = None
+        self.viewport().update()
+        self.loopRangeChanged.emit(-1, -1)
+
+    def currentLoop(self) -> Tuple[Optional[int], Optional[int]]:
+        """Vrátí (A, B) v ms, nebo (None, None) pokud není nastaveno."""
+        return self._loop_a_ms, self._loop_b_ms
+
+    def markLoopStartAtPlayhead(self) -> None:
+        """Nastaví bod A na aktuální playhead, B zůstane jak je (pokud není, čeká se na doplnění)."""
+        b = self._loop_b_ms
+        self.setLoopPoints(self._playhead_ms, self._playhead_ms if b is None else b)
+
+    def markLoopEndAtPlayhead(self) -> None:
+        """Nastaví bod B na aktuální playhead (A zůstane)."""
+        a = self._loop_a_ms
+        if a is None:
+            # pokud A nebyl, vytvoř obě na playhead, ať je to validní rozsah
+            self.setLoopPoints(self._playhead_ms, self._playhead_ms)
+        else:
+            self.setLoopPoints(a, self._playhead_ms)
+
+    def _paint_loop(self, p: QPainter, cr: QRectF) -> None:
+        if self._loop_a_ms is None or self._loop_b_ms is None:
+            return
+
+        a = int(self._loop_a_ms)
+        b = int(self._loop_b_ms)
+        if b < a:
+            a, b = b, a
+
+        xa = self._ms_to_x(a)
+        xb = self._ms_to_x(b)
+
+        # poloprůhledný pás
+        r = QRectF(max(cr.left(), xa), cr.top(),
+                   max(1.0, min(cr.right(), xb) - max(cr.left(), xa)),
+                   cr.height())
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(140, 100, 200, 60)))
+        p.drawRect(r)
+
+        # svislé „loop“ linky
+        col = QColor(195, 160, 255)
+        p.setPen(QPen(col, 2.0))
+        p.drawLine(QPointF(xa, cr.top()), QPointF(xa, cr.bottom()))
+        p.drawLine(QPointF(xb, cr.top()), QPointF(xb, cr.bottom()))
+
+        # malé „úchyty“ (trojúhelníky) nahoře
+        h = 10.0
+        w = 8.0
+        for x in (xa, xb):
+            tri = QPolygonF([
+                QPointF(x, cr.top()),
+                QPointF(x - w * 0.6, cr.top() + h),
+                QPointF(x + w * 0.6, cr.top() + h),
+            ])
+            p.setPen(QPen(col, 1.2))
+            p.setBrush(QBrush(QColor(195, 160, 255, 180)))
+            p.drawPolygon(tri)
+
+    def _hit_loop_handle(self, pos: QPointF, tol_px: float = 6.0) -> Optional[str]:
+        if self._loop_a_ms is None or self._loop_b_ms is None:
+            return None
+        xa = self._ms_to_x(int(self._loop_a_ms))
+        xb = self._ms_to_x(int(self._loop_b_ms))
+        x = pos.x()
+        if abs(x - xa) <= tol_px:
+            return 'A'
+        if abs(x - xb) <= tol_px:
+            return 'B'
+        return None
+
+    def _handle_loop_mousePress(self, e: QMouseEvent) -> bool:
+        if e.button() != Qt.MouseButton.LeftButton:
+            return False
+
+        pos = e.position()
+        # Shift + táhnutí = vytváření nové smyčky
+        if e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            ms = self._x_to_ms(pos.x())
+            self._loop_dragging = 'region'
+            self._loop_drag_anchor_ms = ms
+            self.setLoopPoints(ms, ms)
+            return True
+
+        hit = self._hit_loop_handle(pos)
+        if hit:
+            self._loop_dragging = hit
+            return True
+
+        return False
+
+    def _handle_loop_mouseMove(self, e: QMouseEvent) -> bool:
+        if not self._loop_dragging:
+            return False
+
+        ms = self._x_to_ms(e.position().x())
+        if self._loop_dragging == 'A':
+            b = self._loop_b_ms if self._loop_b_ms is not None else ms
+            self.setLoopPoints(ms, b)
+        elif self._loop_dragging == 'B':
+            a = self._loop_a_ms if self._loop_a_ms is not None else ms
+            self.setLoopPoints(a, ms)
+        else:  # 'region'
+            self.setLoopPoints(self._loop_drag_anchor_ms, ms)
+        return True
+
+    def _handle_loop_mouseRelease(self, e: QMouseEvent) -> bool:
+        if e.button() != Qt.MouseButton.LeftButton:
+            return False
+        if not self._loop_dragging:
+            return False
+        self._loop_dragging = None
+        return True
