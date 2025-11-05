@@ -69,7 +69,7 @@ class TrackEditorWidget(QAbstractScrollArea):
         # časová osa
         self._canvas_ms = 0  # dříve 240_000 (4 min) – nyní dynamické podle aranže
         self._px_per_ms = 0.10
-        self._min_px_per_ms = 0.02
+        self._min_px_per_ms = 0.001
         self._max_px_per_ms = 1.50
         self._tick_ms_major = 10_000
         self._tick_ms_minor = 2_000
@@ -587,3 +587,16 @@ class TrackEditorWidget(QAbstractScrollArea):
     def showEvent(self, e) -> None:
         super().showEvent(e)
         self._update_scrollbars()
+
+    def resetForNewSource(self, title: Optional[str] = None) -> None:
+        """Vymaže celou aranži a připraví widget na novou hlavní skladbu."""
+        self._cells.clear()
+        self._current_cell_index = None
+        self._pending_label_for_next_cell = title  # první buňka získá titulek až při vytvoření
+        self._waveform = None
+        self._source_duration_ms = 0
+        self._playhead_ms = 0
+        self._canvas_ms = 0
+        self.arrangementChanged.emit()
+        self._update_scrollbars()
+        self.viewport().update()

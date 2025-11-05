@@ -80,8 +80,12 @@ class MainWindow(QMainWindow):
         self._arr_total_ms: int = 0
         self._transport_playing: bool = False
         self._transport_timer = QTimer(self)
-        self._transport_timer.setInterval(30)
+        self._transport_timer.setInterval(16)  # ~60 FPS
         self._transport_timer.timeout.connect(self._transport_tick)
+
+        # kotvy pro absolutní 1:1 čas
+        self._t0_monotonic: float | None = None  # kdy jsme spustili/přeseekovali (monotonic)
+        self._t_anchor_ms: int = 0  # jaká arr pozice v ms odpovídá _t0_monotonic
 
         # --- mixdown cache ---
         self._mix_sig: str = ""             # podpis aktuální aranže (pro cache)
@@ -142,6 +146,7 @@ class MainWindow(QMainWindow):
 
         self.info_label = QLabel("")
 
+        self._tempo_tmp_path: Optional[str] = None
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # levý panel
@@ -403,6 +408,10 @@ class MainWindow(QMainWindow):
                 os.remove(self._mixdown_tmp_path)
         except Exception:
             pass
+        try:
+            self._cleanup_tempo_tmp()
+        except Exception:
+            pass
         if sys.platform.startswith("win"):
             try:
                 self._win_media_filter.unregister_global_playpause_hotkey()
@@ -457,20 +466,42 @@ class MainWindow(QMainWindow):
         self.timeline.update()
 
     def _transport_tick(self):
-        self._arr_time_ms = min(self._arr_time_ms + self._transport_timer.interval(), self._arr_total_ms)
-        self.timeline.setPosition(min(self._arr_time_ms, self._arr_total_ms))
-        self.track_editor.setPlayhead(self._arr_time_ms)
-        self.pos_label.setText(f"{fmt_ms(self._arr_time_ms)} / {fmt_ms(self._arr_total_ms)}")
+        if not self._transport_playing or self._t0_monotonic is None:
+            return
 
-        if self._arr_time_ms >= self._arr_total_ms:
+        elapsed_ms = int((time.monotonic() - self._t0_monotonic) * 1000.0)
+        new_ms = min(self._t_anchor_ms + max(0, elapsed_ms), self._arr_total_ms)
+
+        self._arr_time_ms = new_ms
+        self.timeline.setPosition(new_ms)
+        self.track_editor.setPlayhead(new_ms)
+        self.pos_label.setText(f"{fmt_ms(new_ms)} / {fmt_ms(self._arr_total_ms)}")
+
+        if new_ms >= self._arr_total_ms:
+            # konec aranže
             if self.player.is_playing():
                 self.player.stop()
             self._transport_playing = False
             self._transport_timer.stop()
             self.playpause_btn.setChecked(False)
+            self._t0_monotonic = None
+            self._t_anchor_ms = new_ms
+
+    def _player_position_ms(self) -> Optional[int]:
+        """Preferuj pozici z přehrávače, pokud ji umí vrátit (AudioPlayer.position_ms)."""
+        try:
+            getpos = getattr(self.player, "position_ms", None)
+            if callable(getpos):
+                pos = getpos()
+                if pos is not None:
+                    return int(pos)
+        except Exception:
+            pass
+        return None
 
     def toggle_play_pause(self):
         if self._transport_playing:
+            # pauza
             self._transport_playing = False
             self._transport_timer.stop()
             try:
@@ -478,19 +509,44 @@ class MainWindow(QMainWindow):
             except AttributeError:
                 self.player.stop()
             self.playpause_btn.setChecked(False)
+
+            # zruš kotvu – pozice zůstává v _arr_time_ms
+            self._t0_monotonic = None
+            self._t_anchor_ms = self._arr_time_ms
             return
 
+        # play
         self._ensure_mixdown_loaded(rebuild=(self._mix_sig == ""))
+        self.playpause_btn.setChecked(True)
+
+        # zajisti, že audio je v aktuální pozici (ale UI pojede 1:1 nezávisle)
+        if self._loaded_player_path == (self._mixdown_tmp_path or ""):
+            self.player.seek(self._arr_time_ms)
+            if not self.player.is_playing():
+                self.player.play()
+
+        # nastav kotvy pro 1:1 čas
+        self._t0_monotonic = time.monotonic()
+        self._t_anchor_ms = self._arr_time_ms
+
         self._transport_playing = True
         self._transport_timer.start()
-        self.playpause_btn.setChecked(True)
-        self.on_seek_requested(self._arr_time_ms)
 
     def _on_stop_clicked(self):
         self._transport_playing = False
         self._transport_timer.stop()
         self.player.stop()
         self.playpause_btn.setChecked(False)
+
+        # reset časových kotev
+        self._t0_monotonic = None
+        self._t_anchor_ms = 0
+
+        # vrať pozici na začátek (volitelné – takhle to děláš i teď)
+        self._arr_time_ms = 0
+        self.timeline.setPosition(0)
+        self.track_editor.setPlayhead(0)
+        self.pos_label.setText(f"{fmt_ms(0)} / {fmt_ms(self._arr_total_ms)}")
 
     def on_seek_requested(self, ms_orig: int):
         self._arr_time_ms = max(0, min(ms_orig, self._arr_total_ms))
@@ -502,6 +558,9 @@ class MainWindow(QMainWindow):
             self.player.seek(self._arr_time_ms)
             if self._transport_playing and not self.player.is_playing():
                 self.player.play()
+            if self._transport_playing:
+                self._t0_monotonic = time.monotonic()
+                self._t_anchor_ms = self._arr_time_ms
 
     def on_scrubbed(self, _ms_orig: int):
         pass
@@ -549,6 +608,8 @@ class MainWindow(QMainWindow):
             self.player.seek(min(cur_ms, self.player.duration_ms()))
             if was_playing:
                 self.player.play()
+                self._t0_monotonic = time.monotonic()
+                self._t0_arr_ms = self._arr_time_ms
 
         self.player.media_loaded.connect(_resume)
         self.player.load(path, autostart=False)
@@ -571,7 +632,7 @@ class MainWindow(QMainWindow):
         mix = AudioSegment.silent(duration=total_ms)
 
         for c in cells:
-            src_path = c.path or self._original_path
+            src_path = c.path or (self._tempo_tmp_path or self._original_path)
             if not src_path or not os.path.isfile(src_path):
                 continue
             try:
@@ -767,20 +828,28 @@ class MainWindow(QMainWindow):
         self._play_track_id(track_id)
 
     def _load_and_play_original(self, path: str):
+        self._cleanup_tempo_tmp()
         self._original_path = path
         try:
             self._original_duration_ms = probe_duration_ms(path)
         except Exception:
             self._original_duration_ms = None
 
-        self.track_editor.setClipLabel(os.path.splitext(os.path.basename(path))[0])
+        title = os.path.splitext(os.path.basename(path))[0]
+
+        # DŮLEŽITÉ: reset aranže pro novou skladbu (vymaže staré buňky/obálku)
+        self.track_editor.resetForNewSource(title)
+
+        # teprve teď nastav délku a načti waveform (to založí 1. buňku s novou obálkou)
         self.track_editor.setSourceDuration(self._original_duration_ms or 0)
         self._load_waveform(path)
 
         self._applied_tempo = 1.0
         self._pending_tempo = 1.0
         self._update_tempo_label(pending=False)
-        self.tempo_slider.blockSignals(True); self.tempo_slider.setValue(100); self.tempo_slider.blockSignals(False)
+        self.tempo_slider.blockSignals(True);
+        self.tempo_slider.setValue(100);
+        self.tempo_slider.blockSignals(False)
         self.timeline.setLoopPoints(None, None)
 
         self._arr_time_ms = 0
@@ -790,7 +859,6 @@ class MainWindow(QMainWindow):
         self._loaded_player_path = None
         self.player.stop()
 
-        # okamžitá synchronizace UI/transportu
         self.timeline.setPosition(0)
         self.track_editor.setPlayhead(0)
         self.pos_label.setText(f"{fmt_ms(0)} / {fmt_ms(self._arr_total_ms)}")
@@ -825,8 +893,9 @@ class MainWindow(QMainWindow):
         self._apply_pending_tempo()
 
     def _apply_pending_tempo(self):
-        self._applied_tempo = self._pending_tempo
+        self._applied_tempo = float(self._pending_tempo)
         self._update_tempo_label(pending=False)
+        self._apply_player_rate_or_render()
 
     def _update_tempo_label(self, pending: bool):
         waiting = self.tempo_slider.isSliderDown() and (abs(self._pending_tempo - self._applied_tempo) > 1e-6)
@@ -1168,3 +1237,65 @@ class MainWindow(QMainWindow):
         """Opustí fullscreen, pokud v něm zrovna jsme."""
         if self.isFullScreen():
             self.showNormal()
+
+    def _cleanup_tempo_tmp(self):
+        try:
+            if self._tempo_tmp_path and os.path.isfile(self._tempo_tmp_path):
+                if self._tempo_tmp_path != (self._mixdown_tmp_path or ""):
+                    os.remove(self._tempo_tmp_path)
+        except Exception:
+            pass
+        self._tempo_tmp_path = None
+
+    def _apply_player_rate_or_render(self):
+        """Tempo vždy vyrenderuj z originálu a pak přenačti přehrávání/mixdown."""
+        rate = float(self._applied_tempo)
+
+        src = self._original_path
+        if not src or not os.path.isfile(src):
+            QMessageBox.warning(self, "Tempo", "Nenalezen originální zdroj pro změnu tempa.")
+            return
+
+        was_playing = self._transport_playing
+        cur_ms = self._arr_time_ms
+
+        # render z originálu (žádné řetězení)
+        try:
+            try:
+                out_path = render_variant(src, tempo=rate)  # pokud tvoje verze umí pojmenovaný argument
+            except TypeError:
+                out_path = render_variant(src, rate)  # fallback na poziční
+        except Exception as e:
+            QMessageBox.critical(self, "Tempo", f"Nepodařilo se změnit tempo:\n{e}")
+            return
+
+        # ulož a ukliď starý tempo-render
+        self._cleanup_tempo_tmp()
+        self._tempo_tmp_path = out_path
+
+        # přizpůsob délku první "originální" buňky (bez cesty) tak, aby seděla vizuálně
+        try:
+            orig_ms = int(self._original_duration_ms or 0)
+            new_ms = int(round(orig_ms / max(1e-6, rate)))
+            changed = False
+            for c in getattr(self.track_editor, "_cells", []):
+                if not c.path:  # první buňka odkazující na originál
+                    if c.duration_ms != new_ms:
+                        c.duration_ms = new_ms
+                        changed = True
+            if changed:
+                self.track_editor.arrangementChanged.emit()
+        except Exception:
+            pass
+
+        # invaliduj signaturu a přerenderuj mixdown (už z nové tempo-varianty)
+        self._mix_sig = ""
+        self._ensure_mixdown_loaded(rebuild=True)
+
+        # vrátíme se na původní pozici a ukotvíme 1:1 čas
+        self.on_seek_requested(cur_ms)
+        if was_playing and not self.player.is_playing():
+            self.player.play()
+        if self._transport_playing:
+            self._t0_monotonic = time.monotonic()
+            self._t_anchor_ms = self._arr_time_ms
