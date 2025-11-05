@@ -11,6 +11,8 @@ from PyQt6.QtGui import (
     QFont, QDragEnterEvent, QDropEvent, QPolygonF
 )
 from PyQt6.QtWidgets import QAbstractScrollArea
+from PyQt6.QtGui import QImage
+from PyQt6.QtCore import QTimer
 
 
 @dataclass
@@ -45,6 +47,8 @@ class TrackEditorWidget(QAbstractScrollArea):
     libraryTrackDropped = pyqtSignal(str, int, int)
     currentCellChanged = pyqtSignal(int)
     loopRangeChanged = pyqtSignal(int, int)
+    cellDragStarted = pyqtSignal()
+    cellDragFinished = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -90,6 +94,24 @@ class TrackEditorWidget(QAbstractScrollArea):
         # playhead
         self._playhead_ms: int = 0
 
+        # rychlejší scroll/update režim
+        self.viewport().setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.viewport().setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.viewport().setAttribute(Qt.WidgetAttribute.WA_StaticContents, True)
+        self.setAutoFillBackground(False)
+
+        # debouncing signálů během dragování
+        self._arrange_debounce = QTimer(self)
+        self._arrange_debounce.setSingleShot(True)
+        self._arrange_debounce.timeout.connect(self.arrangementChanged)
+
+        self._clip_debounce = QTimer(self)
+        self._clip_debounce.setSingleShot(True)
+        self._clip_debounce.timeout.connect(lambda: self.clipOffsetChanged.emit(self.clipOffset()))
+
+        # cache přerenderovaných waveformů
+        self._wf_cache = {}  # klíč: (id(cell), width, height, round(px_per_ms*1000), id(wf))
+
         # interakce
         self.setMouseTracking(True)
         self.viewport().setMouseTracking(True)
@@ -116,6 +138,7 @@ class TrackEditorWidget(QAbstractScrollArea):
 
         # ---------- veřejné API ----------
     def setWaveform(self, wf: Optional[List[float]], duration_ms: int) -> None:
+        self._invalidate_all_rasters()
         self._waveform = wf[:] if wf else None
         self._source_duration_ms = max(0, int(duration_ms or 0))
         # první buňka (pokud žádná není) – ať má i waveform
@@ -433,7 +456,16 @@ class TrackEditorWidget(QAbstractScrollArea):
 
             wf = c.waveform
             if wf and c.duration_ms > 0:
-                self._draw_smooth_waveform(p, r, wf)
+                # nejdřív obdélník a rámeček (může zůstat jak je)
+                # → to už v kódu máš těsně nadtím
+
+                # waveform z cache
+                raster = self._ensure_waveform_raster(c, r)
+                if raster is not None:
+                    p.drawImage(QPointF(r.left(), r.top()), raster)
+                else:
+                    # fallback na původní kreslení, kdyby něco
+                    self._draw_smooth_waveform(p, r, wf)
         self._paint_loop(p, cr)
 
         # playhead
@@ -492,6 +524,7 @@ class TrackEditorWidget(QAbstractScrollArea):
             self.currentCellChanged.emit(hit)
             self._drag_cell_index = hit
             self._dragging = True
+            self.cellDragStarted.emit()
             self._drag_x_start = pos.x()
             self._drag_y_start = pos.y()
             self._drag_cell_offset_orig = self._cells[hit].offset_ms
@@ -512,6 +545,8 @@ class TrackEditorWidget(QAbstractScrollArea):
 
             lane = self._lane_from_y(pos.y())
             c = self._cells[self._drag_cell_index]
+
+            old_rect = self._cell_rect(c)  # před změnou
             changed = False
             if new_off != c.offset_ms:
                 c.offset_ms = new_off
@@ -521,10 +556,16 @@ class TrackEditorWidget(QAbstractScrollArea):
                 changed = True
 
             if changed:
+                # jen repaint starého a nového obdélníku, ne celé viewport
+                new_rect = self._cell_rect(c)
+                ur = old_rect.united(new_rect).adjusted(-2, -2, 2, 2).toRect()
+                self.viewport().update(ur)
+
+                # debounced signály – ať netrháme timeline a mixdown
                 if self._drag_cell_index == 0:
-                    self.clipOffsetChanged.emit(self.clipOffset())
-                self.arrangementChanged.emit()
-                self.viewport().update()
+                    self._clip_debounce.start(30)
+                self._arrange_debounce.start(30)
+
         else:
             if self._hit_cell(pos.x(), pos.y()) is not None:
                 self.viewport().setCursor(Qt.CursorShape.OpenHandCursor)
@@ -536,6 +577,18 @@ class TrackEditorWidget(QAbstractScrollArea):
             return
         if e.button() == Qt.MouseButton.LeftButton and self._dragging:
             self._dragging = False
+
+            # zruš čekající debouncery a hned pošli finální signály
+            self._arrange_debounce.stop()
+            self._clip_debounce.stop()
+            idx0 = self._drag_cell_index
+
+            self.cellDragFinished.emit()  # MainWindow si teď povolí rebuild
+
+            if idx0 == 0:
+                self.clipOffsetChanged.emit(self.clipOffset())
+            self.arrangementChanged.emit()
+
             self._drag_cell_index = None
             self.viewport().unsetCursor()
 
@@ -555,6 +608,7 @@ class TrackEditorWidget(QAbstractScrollArea):
                 cursor_ms = self._x_to_ms(cursor_x)
                 self._px_per_ms = new_ppm
                 self._choose_ticks()
+                self._invalidate_all_rasters()
                 self._update_scrollbars()
                 new_x = self._ms_to_x(cursor_ms)
                 delta_px = int(new_x - cursor_x)
@@ -642,6 +696,7 @@ class TrackEditorWidget(QAbstractScrollArea):
         self._update_scrollbars()
 
     def resetForNewSource(self, title: Optional[str] = None) -> None:
+        self._invalidate_all_rasters()
         """Vymaže celou aranži a připraví widget na novou hlavní skladbu."""
         self._cells.clear()
         self._current_cell_index = None
@@ -799,3 +854,52 @@ class TrackEditorWidget(QAbstractScrollArea):
             return False
         self._loop_dragging = None
         return True
+
+    def _wf_key(self, c: Cell, r: QRectF) -> tuple:
+        return (id(c), int(r.width()), int(r.height()), int(round(self._px_per_ms * 1000)), id(c.waveform))
+
+    def _invalidate_all_rasters(self) -> None:
+        self._wf_cache.clear()
+
+    def _ensure_waveform_raster(self, c: Cell, r: QRectF) -> Optional[QImage]:
+        wf = c.waveform
+        if not wf or c.duration_ms <= 0 or r.width() < 2 or r.height() < 2:
+            return None
+        key = self._wf_key(c, r)
+        img = self._wf_cache.get(key)
+        if img is not None:
+            return img
+
+        w = max(2, int(r.width()))
+        h = max(2, int(r.height()))
+        img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(0)
+
+        qp = QPainter(img)
+        # antialiasing pro waveform vypneme – rychlejší a bez rozmazání
+        qp.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+
+        # podklad „výplně“ buněk a rámeček vykreslíme v hlavním painteru;
+        # tady jen waveform (sloupce)
+        mid_y = h / 2.0
+        half_h = h * 0.42
+        n = len(wf)
+
+        # tenká linka + svislé „sloupky“ – 1 vzorek na 1 px
+        pen = QPen(self._wf_line, 1)
+        qp.setPen(pen)
+        for x in range(w):
+            t = x / max(1, (w - 1))
+            xf = t * (n - 1)
+            j = int(xf)
+            frac = xf - j
+            v0 = wf[j]
+            v1 = wf[j + 1] if j + 1 < n else wf[j]
+            v = (1 - frac) * v0 + frac * v1  # 0..1
+            y_top = mid_y - float(v) * half_h
+            y_bot = mid_y + float(v) * half_h
+            qp.drawLine(x, int(y_top), x, int(y_bot))
+
+        qp.end()
+        self._wf_cache[key] = img
+        return img

@@ -80,7 +80,7 @@ class MainWindow(QMainWindow):
         self._arr_total_ms: int = 0
         self._transport_playing: bool = False
         self._transport_timer = QTimer(self)
-        self._transport_timer.setInterval(16)  # ~60 FPS
+        self._transport_timer.setInterval(20)
         self._transport_timer.timeout.connect(self._transport_tick)
 
         # kotvy pro absolutní 1:1 čas
@@ -207,6 +207,9 @@ class MainWindow(QMainWindow):
         self.track_editor = TrackEditorWidget()
         right.addWidget(self.track_editor)
 
+        self.track_editor.cellDragStarted.connect(self._on_cell_drag_started)
+        self.track_editor.cellDragFinished.connect(self._on_cell_drag_finished)
+
         splitter.addWidget(left_widget)
         splitter.addWidget(right_widget)
         splitter.setStretchFactor(0, 3)
@@ -262,6 +265,16 @@ class MainWindow(QMainWindow):
         self._autonext_timer.timeout.connect(self._check_autonext)
         self._autonext_timer.start()
 
+        self._editor_change_timer = QTimer(self)
+        self._editor_change_timer.setSingleShot(True)
+        self._editor_change_timer.timeout.connect(self._apply_editor_change_coalesced)
+
+        self._editor_dragging = False
+        self._rebuild_timer = QTimer(self)
+        self._rebuild_timer.setSingleShot(True)
+        self._rebuild_timer.setInterval(140)  # 100–200 ms je fajn
+        self._rebuild_timer.timeout.connect(self._do_rebuild_mixdown)
+
         if sys.platform.startswith("win"):
             def _do_toggle():
                 self.toggle_play_pause()
@@ -280,6 +293,7 @@ class MainWindow(QMainWindow):
 
         self.refresh_list(show_locations=True)
         self.repair_if_needed()
+
 
     # ---------- helpers ----------
     @staticmethod
@@ -434,12 +448,11 @@ class MainWindow(QMainWindow):
         return 0, max(0, int(self._arr_total_ms))
 
     def _on_editor_changed(self):
-        self._mix_sig = ""  # invalidace cache
+        # rychlá obnova UI (délky, overlaye, waveform), ale rebuild audia jen když se netáhne
         self._recompute_total_and_overlays()
-        if self._transport_playing or self._arr_time_ms > 0:
-            cur = self._arr_time_ms
-            self._ensure_mixdown_loaded(rebuild=True)
-            self.on_seek_requested(cur)
+        if self._editor_dragging:
+            return  # ← klíčové: během dragování neplánovat rebuild
+        self._rebuild_timer.start()
 
     def _recompute_total_and_overlays(self):
         self._arr_total_ms = self.track_editor.totalDurationMs()
@@ -476,44 +489,34 @@ class MainWindow(QMainWindow):
         self.timeline.update()
 
     def _transport_tick(self):
-        if not self._transport_playing or self._t0_monotonic is None:
+        if not self._transport_playing:
             return
 
-        # 1) Preferuj skutečnou pozici z přehrávače (umí-li ji dát)
+        if self._rebuilding:
+            return  # během rebuildu UI nehneme
+
+        # Preferuj reálnou pozici z přehrávače
         pos = self._player_position_ms()
         if pos is not None:
-            new_ms = min(max(0, int(pos)), self._arr_total_ms)
+            new_ms = int(min(max(0, pos), self._arr_total_ms))
         else:
-            # 2) Fallback: náš vlastní kotvený čas
+            if self._t0_monotonic is None:
+                return
             elapsed_ms = int((time.monotonic() - self._t0_monotonic) * 1000.0)
-            new_ms = min(self._t_anchor_ms + max(0, elapsed_ms), self._arr_total_ms)
+            new_ms = int(min(self._t_anchor_ms + max(0, elapsed_ms), self._arr_total_ms))
 
-        # 3) Pokud je aktivní A/B loop, obal UI playhead při přeletu přes B
+        # (volitelné) pokud je aktivní loop, můžeš UI wrapovat jak chceš
         a, b = self.track_editor.currentLoop()
-        if a is not None and b is not None and b > a:
-            if new_ms >= b:
-                loop_len = b - a
-                overflow = new_ms - b
-                new_ms = a + (overflow % max(1, loop_len))
+        if a is not None and b is not None and b > a and new_ms >= b:
+            span = max(1, b - a)
+            new_ms = a + (new_ms - b) % span
 
-                # znovu ukotvi čas, ať UI nepřetéká dál
-                self._t0_monotonic = time.monotonic()
-                self._t_anchor_ms = new_ms
-
-                # pokud nečteme reálnou pozici z přehrávače, srovnej i audio
-                if pos is None:
-                    self.player.seek(new_ms)
-                    if self._transport_playing and not self.player.is_playing():
-                        self.player.play()
-
-        # 4) Propis do UI
         self._arr_time_ms = new_ms
         self.timeline.setPosition(new_ms)
         self.track_editor.setPlayhead(new_ms)
         self.pos_label.setText(f"{fmt_ms(new_ms)} / {fmt_ms(self._arr_total_ms)}")
 
-        # 5) Konec aranže řeš jen když není loop
-        if (a is None or b is None) and new_ms >= self._arr_total_ms:
+        if new_ms >= self._arr_total_ms and not (a is not None and b is not None and b > a):
             if self.player.is_playing():
                 self.player.stop()
             self._transport_playing = False
@@ -563,9 +566,9 @@ class MainWindow(QMainWindow):
         # nastav kotvy pro 1:1 čas
         self._t0_monotonic = time.monotonic()
         self._t_anchor_ms = self._arr_time_ms
-
         self._transport_playing = True
         self._transport_timer.start()
+        self._rebuilding: bool = False
 
     def _on_stop_clicked(self):
         self._transport_playing = False
@@ -672,12 +675,33 @@ class MainWindow(QMainWindow):
                 self.player.media_loaded.disconnect(_resume)
             except Exception:
                 pass
+
+            # přepočet délky renderu
             self.on_duration_changed(0)
-            self.player.seek(min(cur_ms, self.player.duration_ms()))
+
+            # přesně seekni na uloženou pozici
+            target = min(cur_ms, self.player.duration_ms())
+            self.player.seek(target)
+
             if was_playing:
+                # znovu spustit přehrávání až PO seeku
                 self.player.play()
-                self._t0_monotonic = time.monotonic()
-                self._t0_arr_ms = self._arr_time_ms
+
+            # pevné ukotvení 1:1 času pro UI
+            self._arr_time_ms = target
+            self.timeline.setPosition(target)
+            self.track_editor.setPlayhead(target)
+            self.pos_label.setText(f"{fmt_ms(target)} / {fmt_ms(self._arr_total_ms)}")
+            self._t0_monotonic = time.monotonic()
+            self._t_anchor_ms = self._arr_time_ms
+
+            # znovu rozběhni transport tick jen pokud předtím hrál
+            self._transport_playing = bool(was_playing)
+            if was_playing and not self._transport_timer.isActive():
+                self._transport_timer.start()
+
+            # konec rebuildu
+            self._rebuilding = False
 
         self.player.media_loaded.connect(_resume)
         self.player.load(path, autostart=False)
@@ -1497,3 +1521,43 @@ class MainWindow(QMainWindow):
         if a is None:
             a = b
         self.track_editor.setLoopPoints(a, b)
+
+    def _apply_editor_change_coalesced(self):
+        self._recompute_total_and_overlays()
+        if self._transport_playing or self._arr_time_ms > 0:
+            cur = self._arr_time_ms
+            self._ensure_mixdown_loaded(rebuild=True)
+            self.on_seek_requested(cur)
+
+    def _on_cell_drag_started(self):
+        self._editor_dragging = True
+        # během dragování necháme hrát starý mix, nerenderujeme
+        self._rebuild_timer.stop()
+
+    def _on_cell_drag_finished(self):
+        self._editor_dragging = False
+        # po puštění myši rychle přerenderujeme a pokračujeme přesně z aktuální pozice
+        self._rebuild_timer.start(10)
+
+    def _do_rebuild_mixdown(self):
+        cur = self._arr_time_ms
+        was_playing = self._transport_playing
+
+        # začínáme rebuild → pozastav tick i audio, ať nic „neskočí“ na 0
+        self._rebuilding = True
+        self._transport_timer.stop()
+        try:
+            if self.player.is_playing():
+                self.player.pause()
+        except AttributeError:
+            self.player.stop()
+
+        # vynutit nový mix a nahrát jej (seek + případné play proběhne v _resume výše)
+        self._mix_sig = ""
+        self._ensure_mixdown_loaded(rebuild=True)
+
+        # UI hned nastav na vnímanou cílovou pozici (jen vizuálně, skutečné přehrání udělá _resume)
+        tgt = min(cur, self._arr_total_ms)
+        self.timeline.setPosition(tgt)
+        self.track_editor.setPlayhead(tgt)
+        self.pos_label.setText(f"{fmt_ms(tgt)} / {fmt_ms(self._arr_total_ms)}")
