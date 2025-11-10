@@ -275,6 +275,10 @@ class MainWindow(QMainWindow):
         self._rebuild_timer.setInterval(140)  # 100–200 ms je fajn
         self._rebuild_timer.timeout.connect(self._do_rebuild_mixdown)
 
+        self._segment_cache: dict[str, "AudioSegment"] = {}
+        self._segment_cache_order: list[str] = []
+        self._segment_cache_max = 12  # jednoduché LRU, klidně uprav
+
         if sys.platform.startswith("win"):
             def _do_toggle():
                 self.toggle_play_pause()
@@ -730,7 +734,7 @@ class MainWindow(QMainWindow):
             tempo = float(getattr(c, "tempo", 1.0))
             src_path = self._get_tempo_variant(src_orig, tempo) if abs(tempo - 1.0) > 1e-6 else src_orig
             try:
-                seg = AudioSegment.from_file(src_path)
+                seg = self._get_segment_cached(src_path)
                 seg = seg[:max(0, int(c.duration_ms))]
                 if len(seg) <= 0:
                     continue
@@ -1561,3 +1565,42 @@ class MainWindow(QMainWindow):
         self.timeline.setPosition(tgt)
         self.track_editor.setPlayhead(tgt)
         self.pos_label.setText(f"{fmt_ms(tgt)} / {fmt_ms(self._arr_total_ms)}")
+
+    def _get_segment_cached(self, src_path: str):
+        from pydub import AudioSegment
+        seg = self._segment_cache.get(src_path)
+        if seg is None:
+            seg = AudioSegment.from_file(src_path)
+            self._segment_cache[src_path] = seg
+            self._segment_cache_order.append(src_path)
+            if len(self._segment_cache_order) > self._segment_cache_max:
+                old = self._segment_cache_order.pop(0)
+                self._segment_cache.pop(old, None)
+        else:
+            # move to back (LRU)
+            try:
+                self._segment_cache_order.remove(src_path)
+            except ValueError:
+                pass
+            self._segment_cache_order.append(src_path)
+        return seg
+
+    def _cleanup_tempo_tmp(self):
+        try:
+            for p in list(self._tempo_tmp_paths):
+                try:
+                    if os.path.isfile(p) and p != (self._mixdown_tmp_path or ""):
+                        os.remove(p)
+                except Exception:
+                    pass
+                finally:
+                    self._tempo_tmp_paths.discard(p)
+                    # vyhoď i z cache
+                    self._segment_cache.pop(p, None)
+                    try:
+                        self._segment_cache_order.remove(p)
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+        self._tempo_cache.clear()
