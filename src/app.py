@@ -1,6 +1,6 @@
 """
 PracticeMaster — app entry point (původní fungující verze + start přes celou obrazovku bez 'Maximized')
-- schovává ffmpeg/ffprobe konzole na Windows
+- schovává ffmpeg/ffprobe konzole na Windows (cíleně jen pro pydub)
 - preferuje bundlované ffmpeg/ffprobe při PyInstalleru
 - High-DPI pro Windows
 - nastaví Qt Multimedia backend na 'windows'
@@ -8,36 +8,30 @@ PracticeMaster — app entry point (původní fungující verze + start přes ce
 """
 from __future__ import annotations
 
-import os, sys, subprocess
+import os, sys
+
+# --- HARD-PIN stdlib subprocess (musí být před jakýmkoli dalším použitím) ---
+import inspect, sysconfig, importlib.util
+try:
+    import subprocess as _sp_test
+    if not inspect.isclass(getattr(_sp_test, "Popen", None)):
+        raise ImportError("shadowed subprocess")
+except Exception:
+    stdlib_dir = sysconfig.get_paths().get("stdlib") or ""
+    sp_path = os.path.join(stdlib_dir, "subprocess.py")
+    if os.path.isfile(sp_path):
+        spec = importlib.util.spec_from_file_location("subprocess", sp_path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        assert spec and spec.loader
+        spec.loader.exec_module(mod)  # type: ignore[arg-type]
+        sys.modules["subprocess"] = mod
+# teď je bezpečně stdlib:
+import subprocess  # noqa: E402
 
 # --- pydub tiše + správný QtMultimedia backend ---
 os.environ.setdefault("PYDUB_SILENCE_LOGGING", "1")
 if sys.platform.startswith("win"):
     os.environ.setdefault("QT_MEDIA_BACKEND", "windows")
-
-# --- schovat ffmpeg/ffprobe konzole na Windows ---
-if sys.platform.startswith("win"):
-    CREATE_NO_WINDOW = 0x08000000
-    STARTF_USESHOWWINDOW = 0x00000001
-    SW_HIDE = 0
-    _real_popen = subprocess.Popen
-
-    def _quiet_popen(*args, **kwargs):
-        try:
-            cmd = kwargs.get("args", args[0])
-            s = " ".join(cmd) if isinstance(cmd, (list, tuple)) else str(cmd)
-            s_low = s.lower()
-            if "ffmpeg" in s_low or "ffprobe" in s_low:
-                si = subprocess.STARTUPINFO()
-                si.dwFlags |= STARTF_USESHOWWINDOW
-                si.wShowWindow = SW_HIDE
-                kwargs["startupinfo"] = si
-                kwargs["creationflags"] = kwargs.get("creationflags", 0) | CREATE_NO_WINDOW
-        except Exception:
-            pass
-        return _real_popen(*args, **kwargs)
-
-    subprocess.Popen = _quiet_popen  # type: ignore[assignment]
 
 # --- preferuj bundlované ffmpeg/ffprobe při PyInstalleru ---
 if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
@@ -49,7 +43,39 @@ if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
     if os.path.isfile(ffprobe_path):
         os.environ["FFPROBE_BINARY"] = ffprobe_path
 
-# NOTE: Import až po monkey-patchi subprocess, aby to pydub „viděl“.
+# --- (NOVĚ) tichý Popen jen pro pydub, NE globálně ---
+def _patch_pydub_quiet_popen_for_windows():
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import pydub.utils as _pdu
+        CREATE_NO_WINDOW = 0x08000000
+        STARTF_USESHOWWINDOW = 0x00000001
+        SW_HIDE = 0
+
+        def _quiet_popen(*args, **kwargs):
+            # skryj okno pouze pro ffmpeg/ffprobe volání pydubu
+            try:
+                cmd = kwargs.get("args", args[0])
+                text = " ".join(cmd) if isinstance(cmd, (list, tuple)) else str(cmd)
+                low = text.lower()
+                if "ffmpeg" in low or "ffprobe" in low:
+                    si = subprocess.STARTUPINFO()
+                    si.dwFlags |= STARTF_USESHOWWINDOW
+                    si.wShowWindow = SW_HIDE
+                    kwargs["startupinfo"] = si
+                    kwargs["creationflags"] = kwargs.get("creationflags", 0) | CREATE_NO_WINDOW
+            except Exception:
+                pass
+            return subprocess.Popen(*args, **kwargs)
+
+        # pydub (nové verze) používá _pdu.Popen, které je alias na subprocess.Popen -> přepiš jen to
+        if hasattr(_pdu, "Popen"):
+            _pdu.Popen = _quiet_popen  # type: ignore[assignment]
+    except Exception:
+        pass
+
+# NOTE: Qt importy až teď (pydub patch je nezávislý)
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QGuiApplication, QCursor
@@ -77,24 +103,18 @@ def _place_window_on_available_screen(win: MainWindow, app: QApplication) -> Non
        Aplikuje se dvakrát (po zobrazení a s malým odkladem), aby nic nepřepsalo velikost."""
     def _apply():
         try:
-            # zruš případnou maximalizaci (pokud to někde uvnitř voláš)
             if win.isMaximized():
                 win.showNormal()
-
-            # obrazovka pod kurzorem, fallback na primární
             scr = QGuiApplication.screenAt(QCursor.pos()) or app.primaryScreen()
             if scr:
-                ag = scr.availableGeometry()  # „celá“ plocha bez taskbaru
+                ag = scr.availableGeometry()
                 win.move(ag.topLeft())
                 win.resize(ag.size())
         except Exception:
             pass
 
-    # 1) nejdřív okno ukaž (některé WM jinak ignorují resize/move)
     win.show()
-    # 2) nastav geometrii hned po zobrazení
     QTimer.singleShot(0, _apply)
-    # 3) a ještě jednou po chvilce (DPI/layou t mohou mezitím pohnout)
     QTimer.singleShot(120, _apply)
 
 
@@ -109,10 +129,11 @@ def main() -> int:
     if aa is not None:
         app.setAttribute(aa, True)
 
-    win = MainWindow()  # i kdyby uvnitř volalo showMaximized(), přepíšeme to
+    # Patchni pydub Popen až teď (po vytvoření venv, před prvním použitím pydubu):
+    _patch_pydub_quiet_popen_for_windows()
 
+    win = MainWindow()
     _place_window_on_available_screen(win, app)
-
     return app.exec()
 
 

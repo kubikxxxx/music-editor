@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from ui.widgets.track_list import TrackListWidget
 from datetime import datetime
 from typing import Optional, Tuple, List
+from ml.infer import DanceAI
 
 import numpy as np
 
@@ -148,6 +149,7 @@ class MainWindow(QMainWindow):
         self._resync_drift_ms = 120
 
         self.info_label = QLabel("")
+
 
         self._tempo_tmp_path: Optional[str] = None
 
@@ -297,9 +299,10 @@ class MainWindow(QMainWindow):
 
         self.refresh_list(show_locations=True)
         self.repair_if_needed()
+        self._ai = DanceAI()
 
 
-    # ---------- helpers ----------
+        # ---------- helpers ----------
     @staticmethod
     def _purple_btn_css() -> str:
         return """
@@ -385,6 +388,9 @@ class MainWindow(QMainWindow):
             act_fav = menu.addAction("Odebrat z oblíbených ★" if fav_now else "Označit jako oblíbené ★")
             menu.addSeparator()
             act_play = menu.addAction("Přehrát")
+            # --- NOVÉ: AI rozpoznání ---
+            act_ai = menu.addAction("Rozpoznat taneční styl (AI)…")
+
             chosen = menu.exec(self.list_widget.mapToGlobal(pos))
             if not chosen:
                 return
@@ -394,11 +400,46 @@ class MainWindow(QMainWindow):
             elif chosen == act_play:
                 self._play_track_id(track_id)
                 self._start_playback()
+            elif chosen == act_ai:
+                self._recognize_style_for_track_id(track_id)  # << nová metoda níže
         else:
             act_reload = menu.addAction("Obnovit seznam")
             chosen = menu.exec(self.list_widget.mapToGlobal(pos))
             if chosen == act_reload:
                 self.refresh_list(show_locations=False)
+
+    def _recognize_style_for_track_id(self, track_id: str):
+        path = self.library.get_track_path(track_id)
+        if not path or not os.path.isfile(path):
+            QMessageBox.warning(self, "Knihovna", "Soubor v knihovně chybí.")
+            return
+
+        # jednoduché blokování UI kurzorem (rychlé a nenásilné)
+        from PyQt6.QtWidgets import QApplication
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            probs, aux = self._ai.predict_proba_all(path)
+        except Exception as e:
+            QMessageBox.critical(self, "AI rozpoznání selhalo", str(e))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        # seřadit od nejvyšší pravděpodobnosti
+        items = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)
+
+        # poskládat hezký text s procenty (1 desetinné místo)
+        lines = [f"{name}: {p * 100:.1f} %" for name, p in items]
+        tempo = aux.get("tempo_med", None)
+        if isinstance(tempo, (int, float)) and tempo > 0:
+            lines.append("")
+            lines.append(f"Odhad BPM (medián): {tempo:.1f}")
+
+        text = "\n".join(lines)
+
+        # zobrazit v dialogu
+        title = self._track_title_by_id(track_id) or os.path.basename(path)
+        QMessageBox.information(self, f"AI rozpoznání – {title}", text)
 
     # ---------- shortcuts / events ----------
     def _install_shortcuts(self):
@@ -985,6 +1026,11 @@ class MainWindow(QMainWindow):
         self.timeline.setPosition(0)
         self.track_editor.setPlayhead(0)
         self.pos_label.setText(f"{fmt_ms(0)} / {fmt_ms(self._arr_total_ms)}")
+        try:
+            lab, conf, aux = self._ai.predict(path)
+            self.info_label.setText(f"AI: {lab} ({conf:.0%}), tempo≈{aux.get('tempo_med', 0):.1f} BPM")
+        except Exception:
+            pass
 
     # ---------- tempo / render ----------
     def on_duration_changed(self, _ms_render: int):
@@ -1130,57 +1176,65 @@ class MainWindow(QMainWindow):
         return 1 if cb.isChecked() else 0
 
     def _find_track_for_dance(self, dance_name: str, *, use_ui_filters: bool = True,
-                              used_ids: set[str] | None = None) -> Optional[Tuple[str, int]]:
-        synonyms = {
-            "samba": [r"\bsamba\b"],
-            "cha cha": [r"\bcha\b.*\bcha\b", r"\bchacha\b", r"\bcha-cha\b", r"\bcha\s*cha\b"],
-            "rumba": [r"\brumba\b", r"\brhumba\b"],
-            "paso doble": [r"\bpaso\b.*\bdoble\b", r"\bpasodoble\b", r"\bpaso\b"],
-            "jive": [r"\bjive\b"],
-            "waltz": [r"(?<!viennese\s)\bwaltz\b"],
-            "tango": [r"\btango\b"],
-            "viennese waltz": [r"\bviennese\b.*\bwaltz\b", r"\bvalčík\b"],
-            "slowfox": [r"\bslow\s*fox\b", r"\bslowfox\b", r"\bfoxtrot\b"],
-            "quickstep": [r"\bquick\s*step\b", r"\bquickstep\b"],
-        }
-        pats = [QRegularExpression(p, QRegularExpression.PatternOption.CaseInsensitiveOption)
-                for p in synonyms.get(dance_name, [dance_name])]
+                              used_ids: set[str] | None = None):
+        """
+        AI výběr: klasifikuj kandidáty on-the-fly a vyber nejlepší shodu.
+        Když se nic nenačte nebo confidence nestačí → fallback na baseline.
+        """
+        import os
+        target = (dance_name or "").strip().lower()
+        if not target:
+            return None
 
         query = (self.search_edit.text() or "").strip().lower() if use_ui_filters else ""
         fav_only = self._favorites_only if use_ui_filters else False
 
-        candidates: List[Tuple[str, str, int]] = []
-
+        candidates = []  # (conf, path, duration_ms)
         try:
             tracks = self.library.list_tracks()
             for t in tracks:
-                title = (t.title or "")
-                title_l = title.lower()
-                if use_ui_filters and query and query not in title_l:
-                    continue
-                if use_ui_filters and fav_only and not self._is_favorite(t.id):
-                    continue
-                if any(rx.match(title_l).hasMatch() for rx in pats):
-                    path = self.library.get_track_path(t.id)
-                    if not path or not os.path.isfile(path):
+                if use_ui_filters:
+                    tl = (t.title or "").lower()
+                    if query and query not in tl:
                         continue
+                    if fav_only and not self._is_favorite(t.id):
+                        continue
+                if used_ids and t.id in used_ids:
+                    continue
+
+                path = self.library.get_track_path(t.id)
+                if not path or not os.path.isfile(path):
+                    continue
+
+                try:
+                    label, conf, aux = self._ai.predict(path)
+                except Exception:
+                    continue
+
+                if self._ai.labels_equal(target, label) and conf >= self._ai.min_conf:
                     dur = int(getattr(t, "duration_ms", 0)) or probe_duration_ms(path)
-                    candidates.append((t.id, path, dur))
+                    candidates.append((conf, path, dur))
         except Exception:
             pass
 
         if not candidates:
-            return None
+            # fallback na původní (název + u waltz/viennese BPM hranice)
+            return self._find_track_for_dance_baseline(dance_name, use_ui_filters=use_ui_filters, used_ids=used_ids)
 
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best_conf, best_path, best_dur = candidates[0]
+
+        # označ jako použitý (pokud sleduješ used_ids)
         if used_ids:
-            fresh = [c for c in candidates if c[0] not in used_ids]
-            if fresh:
-                candidates = fresh
+            try:
+                for t in self.library.list_tracks():
+                    if self.library.get_track_path(t.id) == best_path:
+                        used_ids.add(t.id)
+                        break
+            except Exception:
+                pass
 
-        tid, path, dur = random.choice(candidates)
-        if used_ids is not None:
-            used_ids.add(tid)
-        return path, dur
+        return best_path, best_dur
 
     def _make_gap_segment(self, seconds: int):
         from pydub import AudioSegment
@@ -1604,3 +1658,83 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._tempo_cache.clear()
+
+    def _find_track_for_dance_baseline(self, dance_name: str, *, use_ui_filters: bool = True,
+                                       used_ids: set[str] | None = None):
+        """
+        Původní jednoduchý výběr: podle názvu a u waltz/viennese podle BPM.
+        Vrací (path, duration_ms) nebo None.
+        """
+        import re, random, os
+        import numpy as _np
+        try:
+            import librosa
+        except Exception:
+            librosa = None
+
+        target = (dance_name or "").strip().lower()
+        if not target:
+            return None
+
+        # title regexy
+        syn = {
+            "samba": [r"\bsamba\b"],
+            "cha cha": [r"\bcha\b.*\bcha\b", r"\bchacha\b", r"\bcha-cha\b", r"\bcha\s*cha\b"],
+            "rumba": [r"\brumba\b", r"\brhumba\b"],
+            "paso doble": [r"\bpaso\b.*\bdoble\b", r"\bpasodoble\b", r"\bpaso\b"],
+            "jive": [r"\bjive\b"],
+            "waltz": [r"\bwaltz\b", r"\bwalzer\b", r"\bval(č|c)i(k|k)\b", r"\bvalse\b", r"\bviennese\b"],
+            "viennese waltz": [r"\bwaltz\b", r"\bwalzer\b", r"\bval(č|c)i(k|k)\b", r"\bvalse\b", r"\bviennese\b"],
+            "tango": [r"\btango\b"],
+            "slowfox": [r"\bslow\s*fox\b", r"\bslowfox\b", r"\bfoxtrot\b"],
+            "quickstep": [r"\bquick\s*step\b", r"\bquickstep\b"],
+        }
+        pats = [re.compile(p, re.I) for p in syn.get(target, [re.escape(target)])]
+
+        query = (self.search_edit.text() or "").strip().lower() if use_ui_filters else ""
+        fav_only = self._favorites_only if use_ui_filters else False
+
+        cands = []
+        try:
+            tracks = self.library.list_tracks()
+            for t in tracks:
+                title = (t.title or "")
+                tl = title.lower()
+
+                if use_ui_filters and query and query not in tl:
+                    continue
+                if use_ui_filters and fav_only and not self._is_favorite(t.id):
+                    continue
+                if used_ids and t.id in used_ids:
+                    continue
+
+                if not any(p.search(tl) for p in pats):
+                    continue
+
+                path = self.library.get_track_path(t.id)
+                if not path or not os.path.isfile(path):
+                    continue
+
+                dur = int(getattr(t, "duration_ms", 0)) or probe_duration_ms(path)
+
+                # speciální pravidlo pro waltz/viennese podle tempa (pokud je k dispozici librosa)
+                if target in ("waltz", "viennese waltz") and librosa is not None:
+                    try:
+                        y, sr = librosa.load(path, sr=22050, mono=True, duration=45.0)
+                        tempi = librosa.beat.tempo(y=y, sr=sr, aggregate=None)
+                        bpm = float(_np.median(tempi)) if tempi is not None and len(tempi) else 0.0
+                        # hranice: <=35 → waltz, >=55 → viennese; jinak nechat projít oběma
+                        if target == "waltz" and bpm >= 55.0:
+                            continue
+                        if target == "viennese waltz" and bpm <= 35.0:
+                            continue
+                    except Exception:
+                        pass
+
+                cands.append((path, dur))
+        except Exception:
+            pass
+
+        if not cands:
+            return None
+        return random.choice(cands)

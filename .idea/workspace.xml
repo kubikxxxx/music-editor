@@ -4,9 +4,15 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="563ca7a4-b125-41c9-b2b5-90b60074cc9d" name="Changes" comment="přidané drag and drop z listu knihovny">
+    <list default="true" id="563ca7a4-b125-41c9-b2b5-90b60074cc9d" name="Changes" comment="funguje editor s přidáváním více buňek, a hýbání s nimi, také se aplikace otevírá přes celé okno">
+      <change afterPath="$PROJECT_DIR$/src/ml/labels_index.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/src/ml/segment.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/app.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/app.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/ml/features.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ml/features.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/ml/infer.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ml/infer.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/ml/train.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ml/train.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/ui/main_window.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/main_window.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -122,7 +128,10 @@
       <workItem from="1762451250480" duration="1063000" />
       <workItem from="1762458362307" duration="1245000" />
       <workItem from="1762500082755" duration="220000" />
-      <workItem from="1762757448294" duration="324000" />
+      <workItem from="1762757448294" duration="2476000" />
+      <workItem from="1762773721488" duration="622000" />
+      <workItem from="1762847965144" duration="23577000" />
+      <workItem from="1762946997985" duration="3551000" />
     </task>
     <task id="LOCAL-00001" summary="test">
       <option name="closed" value="true" />
@@ -196,7 +205,15 @@
       <option name="project" value="LOCAL" />
       <updated>1762371016560</updated>
     </task>
-    <option name="localTasksCounter" value="10" />
+    <task id="LOCAL-00010" summary="funguje editor s přidáváním více buňek, a hýbání s nimi, také se aplikace otevírá přes celé okno">
+      <option name="closed" value="true" />
+      <created>1762758152094</created>
+      <option name="number" value="00010" />
+      <option name="presentableId" value="LOCAL-00010" />
+      <option name="project" value="LOCAL" />
+      <updated>1762758152094</updated>
+    </task>
+    <option name="localTasksCounter" value="11" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -224,7 +241,8 @@
     <MESSAGE value="funkční tempo pro každou buňku editoru zvlášť" />
     <MESSAGE value="optimalizace/plynulost" />
     <MESSAGE value="přidané drag and drop z listu knihovny" />
-    <option name="LAST_COMMIT_MESSAGE" value="přidané drag and drop z listu knihovny" />
+    <MESSAGE value="funguje editor s přidáváním více buňek, a hýbání s nimi, také se aplikace otevírá přes celé okno" />
+    <option name="LAST_COMMIT_MESSAGE" value="funguje editor s přidáváním více buňek, a hýbání s nimi, také se aplikace otevírá přes celé okno" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/music_editor$app.coverage" NAME="app Coverage Results" MODIFIED="1758724513729" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src" />
