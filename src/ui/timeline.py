@@ -7,21 +7,21 @@ from PyQt6.QtCore import Qt, QSize, QRectF, QPointF, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen, QBrush, QMouseEvent, QPaintEvent, QPolygonF
 from PyQt6.QtWidgets import QWidget
 
+from ui.theme import Theme
+
 
 class TimelineWidget(QWidget):
     """
     Waveform timeline se smyčkami A/B, přehrávacím kurzorem a volitelnými overlayi.
-    Pravé tlačítko pro výběr je ZAKÁZÁNO (na přání) – pouze scrub & loop-handles.
+    Pravé tlačítko pro výběr je ZAKÁZÁNO – pouze scrub & loop-handles.
     """
 
-    # signály pro player / okolní UI
     seekRequested = pyqtSignal(int)
     scrubbed = pyqtSignal(int)
     loopAChanged = pyqtSignal(int)
     loopBChanged = pyqtSignal(int)
     clearLoopRequested = pyqtSignal()
 
-    # ponecháme pro kompatibilitu, ale neemitujeme (pravý click vypnut)
     selectionChanged = pyqtSignal(int, int)
     selectionFinalized = pyqtSignal(int, int, int, int)
 
@@ -38,22 +38,30 @@ class TimelineWidget(QWidget):
 
         self._preview_ms: Optional[int] = None
 
-        # selekce vypnutá – necháme proměnné jen kvůli kompatibilitě API
         self._sel_a_ms: Optional[int] = None
         self._sel_b_ms: Optional[int] = None
         self._sel_dragging: bool = False
 
-        # overlays – list dictů nebo trojic (a_ms, b_ms, QColor)
         self._overlays: list[Any] = []
 
-        self._bg = QColor(30, 30, 30)
-        self._axis = QColor(60, 60, 60)
-        self._wave = QColor(160, 160, 160)
-        self._fill = QColor(110, 110, 110)
-        self._playhead = QColor(195, 160, 255)
-        self._ghost = QColor(255, 210, 120)
-        self._loop_col = QColor(120, 200, 255, 70)
-        self._handle_col = QColor(200, 220, 255)
+        # default (přebije applyTheme)
+        self._bg = QColor("#0B0B0D")
+        self._panel = QColor("#0F0F11")
+        self._border = QColor("#2A2A2E")
+        self._axis = QColor("#2D2D34")
+
+        # waveform NEUTRÁLNÍ (bez accentu)
+        self._wave = QColor(235, 235, 235, 140)
+        self._fill = QColor(235, 235, 235, 40)
+
+        # ✅ playhead/ghost/handles neutrální (bez accentu)
+        self._playhead = QColor(235, 235, 235, 210)
+        self._ghost = QColor(235, 235, 235, 140)
+        self._handle_col = QColor(235, 235, 235, 220)
+
+        # loop overlay velmi jemný neutrální
+        self._loop_col = QColor(255, 255, 255, 20)
+
         self._pad_left = 8
         self._pad_right = 8
         self._pad_top = 10
@@ -61,6 +69,32 @@ class TimelineWidget(QWidget):
 
         self._drag_mode: Optional[str] = None  # "scrub" | "A" | "B"
         self._last_hover: Optional[str] = None
+
+    # ---------- THEME ----------
+    def applyTheme(self, theme: Theme) -> None:
+        c = theme.colors()
+
+        # pozadí podle theme (dark/light)
+        self._bg = c["bg"]
+        self._panel = c["panel"]
+        self._border = c["border"]
+        self._axis = c["axis"]
+
+        base = c["neutral"]
+
+        # waveform
+        self._wave = QColor(base.red(), base.green(), base.blue(), 140)
+        self._fill = QColor(base.red(), base.green(), base.blue(), 40)
+
+        # playhead + ghost + loop handles
+        self._playhead = QColor(base.red(), base.green(), base.blue(), 210)
+        self._ghost = QColor(base.red(), base.green(), base.blue(), 140)
+        self._handle_col = QColor(base.red(), base.green(), base.blue(), 220)
+
+        # loop overlay (jemný neutrální)
+        self._loop_col = QColor(base.red(), base.green(), base.blue(), 20)
+
+        self.update()
 
     # ---------- public API ----------
     def setDuration(self, ms: int) -> None:
@@ -105,17 +139,10 @@ class TimelineWidget(QWidget):
                 self._waveform = arr
         self.update()
 
-    # --- overlays (nové) ---
     def setOverlays(self, overlays: list[Any]) -> None:
-        """
-        Přijímá:
-          - list dictů: {"type":"region","start":ms,"end":ms,"color":QColor}
-          - nebo list trojic: (start_ms, end_ms, QColor)
-        """
         self._overlays = list(overlays or [])
         self.update()
 
-    # zachováme API pro selection kvůli okolnímu kódu, ale nevyužíváme
     def selection(self) -> Tuple[Optional[int], Optional[int]]:
         return self._sel_a_ms, self._sel_b_ms
 
@@ -155,11 +182,16 @@ class TimelineWidget(QWidget):
     def paintEvent(self, e: QPaintEvent) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        # background panel + border
         p.fillRect(self.rect(), self._bg)
+        p.setPen(QPen(self._border, 1))
+        p.setBrush(QBrush(self._panel))
+        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 10, 10)
 
         cr = self._content_rect()
 
-        # osa
+        # axis
         p.setPen(QPen(self._axis, 1))
         mid_y = cr.center().y()
         p.drawLine(QPointF(cr.left(), mid_y), QPointF(cr.right(), mid_y))
@@ -169,34 +201,38 @@ class TimelineWidget(QWidget):
             wf = self._waveform
             n = len(wf)
             if n >= 2:
-                poly = QPolygonF()
+                top = QPolygonF()
+                bot = QPolygonF()
+                amp_h = cr.height() * 0.48
+
                 for i, v in enumerate(wf):
                     x = cr.left() + (i / (n - 1)) * cr.width()
                     amp = float(v)
-                    y = mid_y - amp * (cr.height() * 0.48)
-                    poly.append(QPointF(x, y))
-                for i, v in reversed(list(enumerate(wf))):
-                    x = cr.left() + (i / (n - 1)) * cr.width()
-                    amp = float(v)
-                    y = mid_y + amp * (cr.height() * 0.48)
-                    poly.append(QPointF(x, y))
+                    top.append(QPointF(x, mid_y - amp * amp_h))
+                    bot.append(QPointF(x, mid_y + amp * amp_h))
+
+                poly = QPolygonF(top)
+                for i in range(bot.count() - 1, -1, -1):
+                    poly.append(bot[i])
+
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QBrush(self._fill))
                 p.drawPolygon(poly)
-                p.setPen(QPen(self._wave, 1))
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.drawPolyline(poly)
 
-        # overlays (regiony)
+                p.setPen(QPen(self._wave, 1.2))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawPolyline(top)
+                p.drawPolyline(bot)
+
+        # overlays (ponecháme jak jsou – barvy přichází z MainWindow; pokud chceš i to neutral,
+        # tak v MainWindow generuj overlay color z border místo accent)
         if self._overlays:
             for item in self._overlays:
-                # dict forma
                 if isinstance(item, dict):
                     a_ms = int(item.get("start", 0))
                     b_ms = int(item.get("end", a_ms))
-                    color = item.get("color", QColor(90, 200, 160, 80))
+                    color = item.get("color", QColor(255, 255, 255, 18))
                 else:
-                    # tuple/list forma
                     try:
                         a_ms, b_ms, color = item
                     except Exception:
@@ -206,15 +242,16 @@ class TimelineWidget(QWidget):
                 if xb > xa:
                     p.fillRect(QRectF(xa, cr.top(), xb - xa, cr.height()), color)
 
-        # loop overlay
+        # loop overlay (neutral)
         if self._loop_a_ms is not None and self._loop_b_ms is not None:
             xa = self._ms_to_x(self._loop_a_ms)
             xb = self._ms_to_x(self._loop_b_ms)
-            if xb < xa: xa, xb = xb, xa
+            if xb < xa:
+                xa, xb = xb, xa
             p.fillRect(QRectF(xa, cr.top(), xb - xa, cr.height()), self._loop_col)
 
-        # loop handles
-        p.setPen(QPen(self._handle_col, 2))
+        # loop handles (neutral)
+        p.setPen(QPen(self._handle_col, 2.2))
         if self._loop_a_ms is not None:
             x = self._ms_to_x(self._loop_a_ms)
             p.drawLine(QPointF(x, cr.top()), QPointF(x, cr.bottom()))
@@ -222,14 +259,14 @@ class TimelineWidget(QWidget):
             x = self._ms_to_x(self._loop_b_ms)
             p.drawLine(QPointF(x, cr.top()), QPointF(x, cr.bottom()))
 
-        # playhead
-        p.setPen(QPen(self._playhead, 2.2))
+        # playhead (neutral)
+        p.setPen(QPen(self._playhead, 2.4))
         x = self._ms_to_x(self._position_ms)
         p.drawLine(QPointF(x, cr.top()), QPointF(x, cr.bottom()))
 
-        # ghost scrub
+        # ghost scrub (neutral)
         if self._drag_mode == "scrub" and self._preview_ms is not None:
-            pen = QPen(self._ghost, 1.6, Qt.PenStyle.DashLine)
+            pen = QPen(self._ghost, 1.8, Qt.PenStyle.DashLine)
             p.setPen(pen)
             gx = self._ms_to_x(self._preview_ms)
             p.drawLine(QPointF(gx, cr.top()), QPointF(gx, cr.bottom()))
@@ -246,18 +283,18 @@ class TimelineWidget(QWidget):
     def mousePressEvent(self, e: QMouseEvent) -> None:
         x = e.position().x()
 
-        # Pravý klik: výběr je vypnut – ignorujeme.
         if e.button() == Qt.MouseButton.RightButton:
             return
-
         if e.button() != Qt.MouseButton.LeftButton:
             return
 
         handle = self._hit_handle(x)
         if handle == "A":
-            self._drag_mode = "A"; return
+            self._drag_mode = "A"
+            return
         if handle == "B":
-            self._drag_mode = "B"; return
+            self._drag_mode = "B"
+            return
 
         self._drag_mode = "scrub"
         self._preview_ms = self._x_to_ms(x)

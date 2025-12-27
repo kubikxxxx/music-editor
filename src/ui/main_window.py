@@ -11,6 +11,7 @@ from ui.widgets.track_list import TrackListWidget
 from datetime import datetime
 from typing import Optional, Tuple, List
 from ml.infer import DanceAI
+import shutil
 
 import numpy as np
 
@@ -18,22 +19,25 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog,
     QListWidgetItem, QMessageBox, QSplitter, QLineEdit, QSlider, QMenu,
-    QSizePolicy, QCheckBox, QInputDialog, QDialog, QDialogButtonBox
+    QSizePolicy, QCheckBox, QInputDialog, QDialog, QDialogButtonBox,
+    QColorDialog, QApplication
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QPoint, QRegularExpression,
     QCoreApplication, QEvent
 )
-from PyQt6.QtGui import QShortcut, QKeySequence, QColor
+from PyQt6.QtGui import QShortcut, QKeySequence, QColor, QAction
 
 from audio.player import AudioPlayer
-from audio.processing import render_variant  # (zůstává; tempo mixdownu teď neřešíme)
+from audio.processing import render_variant
 from library.manager import Library
 from ui.timeline import TimelineWidget
 
 from ui.widgets.play_pause_button import PlayPauseButton
 from ui.widgets.win_media import WinMediaKeyFilter
 from ui.track_editor import TrackEditorWidget, Cell
+
+from ui.theme import Theme, qss_for_theme
 
 
 def fmt_ms(ms: int) -> str:
@@ -84,19 +88,18 @@ class MainWindow(QMainWindow):
         self._transport_timer.setInterval(20)
         self._transport_timer.timeout.connect(self._transport_tick)
 
-        # kotvy pro absolutní 1:1 čas
-        self._t0_monotonic: float | None = None  # kdy jsme spustili/přeseekovali (monotonic)
-        self._t_anchor_ms: int = 0  # jaká arr pozice v ms odpovídá _t0_monotonic
+        self._t0_monotonic: float | None = None
+        self._t_anchor_ms: int = 0
 
         # --- mixdown cache ---
-        self._mix_sig: str = ""             # podpis aktuální aranže (pro cache)
+        self._mix_sig: str = ""
         self._mixdown_tmp_path: Optional[str] = None
         self._loaded_player_path: Optional[str] = None
 
         self._tempo_cache: dict[tuple[str, float], str] = {}
         self._tempo_tmp_paths: set[str] = set()
 
-        # --- UI prvky ---
+        # --- UI ---
         self.open_btn = QPushButton("Open…")
         self.open_btn.setStyleSheet(self._purple_btn_css())
         self.prev_btn = QPushButton("Previous")
@@ -150,12 +153,10 @@ class MainWindow(QMainWindow):
 
         self.info_label = QLabel("")
 
-
         self._tempo_tmp_path: Optional[str] = None
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # levý panel
         left_widget = QWidget()
         left = QVBoxLayout(left_widget)
         left.setContentsMargins(8, 8, 8, 8)
@@ -169,7 +170,6 @@ class MainWindow(QMainWindow):
         left.addLayout(rowL)
         left.addWidget(self.info_label)
 
-        # pravý panel
         right_widget = QWidget()
         right = QVBoxLayout(right_widget)
         right.setContentsMargins(8, 8, 8, 8)
@@ -205,7 +205,6 @@ class MainWindow(QMainWindow):
         right.addLayout(row2)
         right.addLayout(row3)
 
-        # track editor
         self.track_editor = TrackEditorWidget()
         right.addWidget(self.track_editor)
 
@@ -228,21 +227,21 @@ class MainWindow(QMainWindow):
         self.player = AudioPlayer()
         self.player.duration_changed.connect(self.on_duration_changed)
 
-        # timeline signály
+        # timeline signals
         self.timeline.seekRequested.connect(self.on_seek_requested)
         self.timeline.scrubbed.connect(self.on_scrubbed)
         self.timeline.loopAChanged.connect(self.on_loop_a_changed)
         self.timeline.loopBChanged.connect(self.on_loop_b_changed)
         self.timeline.clearLoopRequested.connect(self.on_clear_loop)
 
-        # editor -> timeline / transport
+        # editor signals
         self.track_editor.clipOffsetChanged.connect(self._on_clip_offset_changed)
-        self.track_editor.arrangementChanged.connect(self._on_editor_changed)   # změna aranže → přepočet + invalidace mixu
+        self.track_editor.arrangementChanged.connect(self._on_editor_changed)
         self.track_editor.externalFileDropped.connect(self._on_external_file_dropped)
         self.track_editor.libraryTrackDropped.connect(self._on_library_track_dropped)
         self.track_editor.currentCellChanged.connect(self._on_cell_selected)
 
-        # ovládání
+        # actions
         self.open_btn.clicked.connect(self.open_file_direct)
         self.playpause_btn.clicked.connect(self.toggle_play_pause)
         self.stop_btn.clicked.connect(self._on_stop_clicked)
@@ -274,13 +273,16 @@ class MainWindow(QMainWindow):
         self._editor_dragging = False
         self._rebuild_timer = QTimer(self)
         self._rebuild_timer.setSingleShot(True)
-        self._rebuild_timer.setInterval(140)  # 100–200 ms je fajn
+        self._rebuild_timer.setInterval(140)
         self._rebuild_timer.timeout.connect(self._do_rebuild_mixdown)
 
         self._segment_cache: dict[str, "AudioSegment"] = {}
         self._segment_cache_order: list[str] = []
-        self._segment_cache_max = 12  # jednoduché LRU, klidně uprav
+        self._segment_cache_max = 12
 
+        self._rebuilding: bool = False
+
+        # media keys
         if sys.platform.startswith("win"):
             def _do_toggle():
                 self.toggle_play_pause()
@@ -297,29 +299,219 @@ class MainWindow(QMainWindow):
                     pass
             QTimer.singleShot(0, _late_register)
 
+        # --- THEME state ---
+        self._theme = self._load_theme_or_default()
+        self._apply_theme(self._theme)
+        self._install_theme_menu()
+
         self.refresh_list(show_locations=True)
         self.repair_if_needed()
         self._ai = DanceAI()
+        self._install_export_menu()
 
 
         # ---------- helpers ----------
     @staticmethod
     def _purple_btn_css() -> str:
+        # nepřebíjej globální black/gold theme
+        return ""
+
+    # ---------- THEME (black/gold) ----------
+    @staticmethod
+    def _black_gold_qss() -> str:
         return """
-        QPushButton {
-            background-color: #6A0DAD;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            padding: 8px 16px;
-            font-size: 14px;
-            width: 74px;
-            height: 20px;
-            border-width: 37px 0px 37px 74px;
+        /* ---- Base ---- */
+        QMainWindow, QWidget {
+            background-color: #0B0B0D;
+            color: #EDEDED;
+            font-size: 13px;
         }
-        QPushButton:hover { background-color: #8A2BE2; }
-        QPushButton:pressed { background-color: #5B0092; }
+        QLabel { color: #EDEDED; }
+
+        /* ---- Inputs ---- */
+        QLineEdit {
+            background: #121214;
+            border: 1px solid #2A2A2E;
+            border-radius: 8px;
+            padding: 7px 10px;
+            selection-background-color: #D4AF37;
+            selection-color: #000000;
+        }
+        QLineEdit:focus { border: 1px solid #D4AF37; }
+
+        /* ---- Lists ---- */
+        QListWidget {
+            background: #0F0F11;
+            border: 1px solid #2A2A2E;
+            border-radius: 10px;
+            padding: 4px;
+            outline: 0;
+        }
+        QListWidget::item {
+            padding: 7px 10px;
+            margin: 1px 2px;
+            border-radius: 8px;
+        }
+        QListWidget::item:hover { background: #1A1A1F; }
+        QListWidget::item:selected {
+            background: #D4AF37;
+            color: #000000;
+        }
+
+        /* ---- Buttons (default dark) ---- */
+        QPushButton, QToolButton {
+            background-color: #16161B;
+            color: #EDEDED;
+            border: 1px solid #2A2A2E;
+            border-radius: 8px;
+            padding: 8px 12px;
+        }
+        QPushButton:hover, QToolButton:hover { border: 1px solid #D4AF37; }
+        QPushButton:pressed, QToolButton:pressed { background-color: #101014; }
+        QPushButton:disabled, QToolButton:disabled {
+            color: #7C7C7C;
+            border: 1px solid #232327;
+            background: #0F0F11;
+        }
+
+        /* ---- Roles ---- */
+        QPushButton[pmRole="primary"], QToolButton[pmRole="primary"] {
+            background-color: #D4AF37;
+            color: #000000;
+            border: 1px solid #D4AF37;
+            font-weight: 600;
+        }
+        QPushButton[pmRole="primary"]:hover, QToolButton[pmRole="primary"]:hover {
+            background-color: #E2C15A;
+            border: 1px solid #E2C15A;
+        }
+        QPushButton[pmRole="primary"]:pressed, QToolButton[pmRole="primary"]:pressed {
+            background-color: #B69127;
+            border: 1px solid #B69127;
+        }
+
+        QPushButton[pmRole="danger"], QToolButton[pmRole="danger"] {
+            background-color: #16161B;
+            color: #FFD88A;
+            border: 1px solid #B88A2E;
+            font-weight: 600;
+        }
+        QPushButton[pmRole="danger"]:hover, QToolButton[pmRole="danger"]:hover {
+            background-color: #241B08;
+            border: 1px solid #D4AF37;
+            color: #FFDFA3;
+        }
+
+        /* ---- Checkboxes ---- */
+        QCheckBox { spacing: 8px; }
+        QCheckBox::indicator {
+            width: 16px; height: 16px;
+            border-radius: 4px;
+            border: 1px solid #2A2A2E;
+            background: #121214;
+        }
+        QCheckBox::indicator:checked {
+            background: #D4AF37;
+            border: 1px solid #D4AF37;
+        }
+
+        /* ---- Sliders ---- */
+        QSlider::groove:horizontal {
+            height: 6px;
+            background: #26262B;
+            border-radius: 3px;
+        }
+        QSlider::sub-page:horizontal {
+            background: #D4AF37;
+            border-radius: 3px;
+        }
+        QSlider::handle:horizontal {
+            width: 14px;
+            margin: -6px 0px;
+            border-radius: 7px;
+            background: #D4AF37;
+            border: 1px solid #000000;
+        }
+
+        /* ---- Menus ---- */
+        QMenu {
+            background: #121214;
+            border: 1px solid #2A2A2E;
+            border-radius: 10px;
+            padding: 6px;
+        }
+        QMenu::item {
+            padding: 7px 16px;
+            border-radius: 8px;
+        }
+        QMenu::item:selected {
+            background: #D4AF37;
+            color: #000000;
+        }
+
+        /* ---- Splitter ---- */
+        QSplitter::handle { background: #141417; }
+        QSplitter::handle:hover { background: #D4AF37; }
+
+        /* ---- Scrollbars ---- */
+        QScrollBar:vertical {
+            background: #0F0F11;
+            width: 12px;
+            margin: 0px;
+        }
+        QScrollBar::handle:vertical {
+            background: #2A2A2E;
+            border-radius: 6px;
+            min-height: 24px;
+        }
+        QScrollBar::handle:vertical:hover { background: #D4AF37; }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+
+        /* ---- Tooltips ---- */
+        QToolTip {
+            background-color: #121214;
+            color: #EDEDED;
+            border: 1px solid #D4AF37;
+            padding: 6px;
+            border-radius: 6px;
+        }
+
+        /* ---- Optional: custom widgets borders ---- */
+        TimelineWidget, TrackEditorWidget, TrackListWidget {
+            background: #0F0F11;
+            border: 1px solid #2A2A2E;
+            border-radius: 10px;
+        }
         """
+
+    def _apply_black_gold_theme(self):
+        from PyQt6.QtWidgets import QApplication
+
+        # role styling
+        self.practice_btn.setProperty("pmRole", "primary")
+        self.playpause_btn.setProperty("pmRole", "primary")
+        self.delete_btn.setProperty("pmRole", "danger")
+
+        # apply globally (affects dialogs/menus too)
+        app = QApplication.instance()
+        if app:
+            app.setStyleSheet(self._black_gold_qss())
+        else:
+            self.setStyleSheet(self._black_gold_qss())
+
+        # repolish widgets after setting properties
+        for w in (
+            self.practice_btn, self.playpause_btn, self.delete_btn,
+            self.open_btn, self.prev_btn, self.stop_btn, self.next_btn,
+            self.import_btn, self.repair_btn, self.relink_btn,
+            self.search_edit, self.list_widget, self.timeline, self.track_editor
+        ):
+            try:
+                w.style().unpolish(w)
+                w.style().polish(w)
+            except Exception:
+                pass
+            w.update()
 
     # ---------- favorites ----------
     def _fav_store_path(self) -> str | None:
@@ -493,11 +685,11 @@ class MainWindow(QMainWindow):
         return 0, max(0, int(self._arr_total_ms))
 
     def _on_editor_changed(self):
-        # rychlá obnova UI (délky, overlaye, waveform), ale rebuild audia jen když se netáhne
         self._recompute_total_and_overlays()
         if self._editor_dragging:
-            return  # ← klíčové: během dragování neplánovat rebuild
+            return
         self._rebuild_timer.start()
+
 
     def _recompute_total_and_overlays(self):
         self._arr_total_ms = self.track_editor.totalDurationMs()
@@ -506,10 +698,15 @@ class MainWindow(QMainWindow):
         wf_mix = self.track_editor.exportMixdownWaveform(buckets=3000)
         self.timeline.setWaveform(wf_mix)
 
+        # theme-aware overlay colors
+        c = self._theme.colors()
+        empty = QColor(c["border"].red(), c["border"].green(), c["border"].blue(), 90)
+        full = QColor(c["border"].red(), c["border"].green(), c["border"].blue(), 55)
+
         intervals = []
-        for c in getattr(self.track_editor, "_cells", []):
-            if c.duration_ms > 0:
-                intervals.append((c.offset_ms, c.offset_ms + c.duration_ms))
+        for cell in getattr(self.track_editor, "_cells", []):
+            if cell.duration_ms > 0:
+                intervals.append((cell.offset_ms, cell.offset_ms + cell.duration_ms))
         intervals.sort()
         merged = []
         for a, b in intervals:
@@ -522,11 +719,11 @@ class MainWindow(QMainWindow):
         cur = 0
         for a, b in merged:
             if a > cur:
-                overlays.append({"type": "region", "start": cur, "end": a, "color": QColor(120,120,120,110)})
-            overlays.append({"type": "region", "start": a, "end": b, "color": QColor(60,200,140,110)})
+                overlays.append({"type": "region", "start": cur, "end": a, "color": empty})
+            overlays.append({"type": "region", "start": a, "end": b, "color": full})
             cur = b
         if cur < self._arr_total_ms:
-            overlays.append({"type": "region", "start": cur, "end": self._arr_total_ms, "color": QColor(120,120,120,110)})
+            overlays.append({"type": "region", "start": cur, "end": self._arr_total_ms, "color": empty})
         self.timeline.setOverlays(overlays)
 
         self.timeline.setPosition(min(self._arr_time_ms, self._arr_total_ms))
@@ -613,7 +810,7 @@ class MainWindow(QMainWindow):
         self._t_anchor_ms = self._arr_time_ms
         self._transport_playing = True
         self._transport_timer.start()
-        self._rebuilding: bool = False
+        self._rebuilding = False
 
     def _on_stop_clicked(self):
         self._transport_playing = False
@@ -761,6 +958,18 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Chybí pydub", "Pro mixdown je potřeba pydub a FFmpeg v PATH.")
             return None
 
+        def _apply_echo(seg, delay_ms: int, decay_db: float, repeats: int):
+            delay_ms = max(1, int(delay_ms or 0))
+            repeats = max(1, int(repeats or 0))
+            decay_db = abs(float(decay_db or 0.0))
+            out = seg
+            for i in range(1, repeats + 1):
+                d = delay_ms * i
+                if d >= len(seg):
+                    break
+                out = out.overlay(seg.apply_gain(-(decay_db * i)), position=d)
+            return out
+
         cells: List[Cell] = getattr(self.track_editor, "_cells", [])
         total_ms = max(1, int(self.track_editor.totalDurationMs()))
         if not cells:
@@ -772,17 +981,64 @@ class MainWindow(QMainWindow):
             src_orig = c.path or self._original_path
             if not src_orig or not os.path.isfile(src_orig):
                 continue
-            tempo = float(getattr(c, "tempo", 1.0))
+
+            tempo = float(getattr(c, "tempo", 1.0) or 1.0)
+
+            # použij tempo-variantu celého souboru (cache) – jako doposud
             src_path = self._get_tempo_variant(src_orig, tempo) if abs(tempo - 1.0) > 1e-6 else src_orig
+
             try:
-                seg = self._get_segment_cached(src_path)
-                seg = seg[:max(0, int(c.duration_ms))]
+                seg_full = self._get_segment_cached(src_path)
+                if len(seg_full) <= 0:
+                    continue
+
+                # --- výřez v ZDROJI ---
+                # src_in_ms je v "natural" čase; u tempo-varianty ho musíme přepočítat
+                src_in_nat = int(getattr(c, "src_in_ms", 0) or 0)
+                if abs(tempo - 1.0) > 1e-6:
+                    src_in_render = int(round(src_in_nat / max(1e-6, tempo)))
+                else:
+                    src_in_render = src_in_nat
+
+                src_in_render = max(0, min(src_in_render, max(0, len(seg_full) - 1)))
+
+                # cílová délka buňky v přehrávaném čase = duration_ms
+                want_ms = max(0, int(getattr(c, "duration_ms", 0) or 0))
+                if want_ms <= 0:
+                    continue
+
+                seg = seg_full[src_in_render: src_in_render + want_ms]
                 if len(seg) <= 0:
                     continue
-                mix = mix.overlay(seg, position=max(0, int(c.offset_ms)))
+
+                # --- efekty na buňku (v PŘEHRÁVANÉM čase) ---
+                gain_db = float(getattr(c, "gain_db", 0.0) or 0.0)
+                if abs(gain_db) > 1e-6:
+                    seg = seg.apply_gain(gain_db)
+
+                fade_in_ms = int(getattr(c, "fade_in_ms", 0) or 0)
+                fade_out_ms = int(getattr(c, "fade_out_ms", 0) or 0)
+
+                if fade_in_ms > 0:
+                    seg = seg.fade_in(min(fade_in_ms, len(seg)))
+                if fade_out_ms > 0:
+                    seg = seg.fade_out(min(fade_out_ms, len(seg)))
+                echo_on = bool(getattr(c, "echo_enabled", False))
+                if echo_on:
+                    seg = _apply_echo(
+                        seg,
+                        delay_ms=int(getattr(c, "echo_delay_ms", 180) or 180),
+                        decay_db=float(getattr(c, "echo_decay_db", 6.0) or 6.0),
+                        repeats=int(getattr(c, "echo_repeats", 3) or 3),
+                    )
+
+                # --- overlay do mixu ---
+                mix = mix.overlay(seg, position=max(0, int(getattr(c, "offset_ms", 0) or 0)))
+
             except Exception as e:
                 print("Mixdown segment error:", e)
 
+        # uklid starý mixdown
         try:
             if self._mixdown_tmp_path and os.path.isfile(self._mixdown_tmp_path):
                 os.remove(self._mixdown_tmp_path)
@@ -790,7 +1046,10 @@ class MainWindow(QMainWindow):
             pass
 
         tmp_dir = tempfile.gettempdir()
-        out_path = os.path.join(tmp_dir, f"pm_arr_mix_{int(time.time() * 1000)}_{random.randint(0, 999999)}.wav")
+        out_path = os.path.join(
+            tmp_dir,
+            f"pm_arr_mix_{int(time.time() * 1000)}_{random.randint(0, 999999)}.wav"
+        )
         try:
             mix.export(out_path, format="wav")
         except Exception as e:
@@ -1178,63 +1437,92 @@ class MainWindow(QMainWindow):
     def _find_track_for_dance(self, dance_name: str, *, use_ui_filters: bool = True,
                               used_ids: set[str] | None = None):
         """
-        AI výběr: klasifikuj kandidáty on-the-fly a vyber nejlepší shodu.
-        Když se nic nenačte nebo confidence nestačí → fallback na baseline.
+        Hybridní výběr:
+        1) Nejprve vybere skladbu podle názvu/BPM přes _find_track_for_dance_baseline.
+        2) U vybrané skladby jednorázově ověří styl pomocí AI (self._ai).
+        3) Pokud AI potvrdí styl (labels_equal + min_conf), skladbu přijme.
+        4) Pokud AI nesedí, zkusí další kandidáta (zase baseline + AI), max. pár pokusů.
+
+        Vrací (path, duration_ms) nebo None.
+        Používá used_ids k tomu, aby se skladby v rámci jednoho practice neopakovaly.
         """
-        import os
+
         target = (dance_name or "").strip().lower()
         if not target:
             return None
 
-        query = (self.search_edit.text() or "").strip().lower() if use_ui_filters else ""
-        fav_only = self._favorites_only if use_ui_filters else False
+        # kolik různých kandidátů maximálně zkusíme ověřit přes AI
+        max_attempts = 3
 
-        candidates = []  # (conf, path, duration_ms)
-        try:
-            tracks = self.library.list_tracks()
-            for t in tracks:
-                if use_ui_filters:
-                    tl = (t.title or "").lower()
-                    if query and query not in tl:
-                        continue
-                    if fav_only and not self._is_favorite(t.id):
-                        continue
-                if used_ids and t.id in used_ids:
-                    continue
+        # lokální sada „už zkusených, ale AI je zamítlo“
+        tried_ids: set[str] = set()
 
-                path = self.library.get_track_path(t.id)
-                if not path or not os.path.isfile(path):
-                    continue
-
-                try:
-                    label, conf, aux = self._ai.predict(path)
-                except Exception:
-                    continue
-
-                if self._ai.labels_equal(target, label) and conf >= self._ai.min_conf:
-                    dur = int(getattr(t, "duration_ms", 0)) or probe_duration_ms(path)
-                    candidates.append((conf, path, dur))
-        except Exception:
-            pass
-
-        if not candidates:
-            # fallback na původní (název + u waltz/viennese BPM hranice)
-            return self._find_track_for_dance_baseline(dance_name, use_ui_filters=use_ui_filters, used_ids=used_ids)
-
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        best_conf, best_path, best_dur = candidates[0]
-
-        # označ jako použitý (pokud sleduješ used_ids)
-        if used_ids:
+        # helper: najít track_id podle cesty (kvůli used_ids)
+        def _track_id_for_path(path: str) -> str | None:
             try:
                 for t in self.library.list_tracks():
-                    if self.library.get_track_path(t.id) == best_path:
-                        used_ids.add(t.id)
-                        break
+                    p = self.library.get_track_path(t.id)
+                    if p and os.path.abspath(p) == os.path.abspath(path):
+                        return t.id
             except Exception:
                 pass
+            return None
 
-        return best_path, best_dur
+        import os
+
+        attempts = 0
+        while attempts < max_attempts:
+            effective_used: set[str] = set(used_ids or [])
+            effective_used.update(tried_ids)
+
+            cand = self._find_track_for_dance_baseline(
+                dance_name,
+                use_ui_filters=use_ui_filters,
+                used_ids=effective_used,
+            )
+            if not cand:
+                return None
+
+            path, dur_ms = cand
+            track_id = _track_id_for_path(path)
+
+            if track_id and track_id in tried_ids:
+                attempts += 1
+                continue
+
+            # --- AI ověření pouze pro JEDNU vybranou skladbu ---
+            try:
+                label, conf, aux = self._ai.predict(path)
+                min_conf = getattr(self._ai, "min_conf", 0.0)
+                if self._ai.labels_equal(target, label) and conf >= min_conf:
+                    if used_ids is not None and track_id:
+                        used_ids.add(track_id)
+                    return path, dur_ms
+            except Exception:
+                if used_ids is not None and track_id:
+                    used_ids.add(track_id)
+                return path, dur_ms
+
+            if track_id:
+                tried_ids.add(track_id)
+
+            attempts += 1
+
+        effective_used: set[str] = set(used_ids or [])
+        effective_used.update(tried_ids)
+        cand = self._find_track_for_dance_baseline(
+            dance_name,
+            use_ui_filters=use_ui_filters,
+            used_ids=effective_used,
+        )
+        if not cand:
+            return None
+
+        path, dur_ms = cand
+        track_id = _track_id_for_path(path)
+        if used_ids is not None and track_id:
+            used_ids.add(track_id)
+        return path, dur_ms
 
     def _make_gap_segment(self, seconds: int):
         from pydub import AudioSegment
@@ -1334,7 +1622,6 @@ class MainWindow(QMainWindow):
             try:
                 self.library.add_file(out_path)
             except Exception as e:
-                # nepodařilo se zapsat do DB – aspoň přehraj přímo
                 self._current_track_id = None
                 self._gain_regions = []
                 self._load_and_play_original(out_path)
@@ -1374,7 +1661,6 @@ class MainWindow(QMainWindow):
     def _check_autonext(self):
         if not self._auto_next_chk.isChecked():
             return
-        # Dohráno a nic nehraje → přehraj další
         if (not self._transport_playing) and self._arr_time_ms >= self._arr_total_ms and self._filtered_ids:
             try:
                 self.play_next_in_filter(force_play=True)
@@ -1418,7 +1704,6 @@ class MainWindow(QMainWindow):
             return None, 0
 
     def _toggle_fullscreen(self):
-        """Přepne okno mezi fullscreen a normálním režimem."""
         if not hasattr(self, "_normal_geometry"):
             self._normal_geometry = None
 
@@ -1428,23 +1713,8 @@ class MainWindow(QMainWindow):
             self.showFullScreen()
 
     def _exit_fullscreen(self):
-        """Opustí fullscreen, pokud v něm zrovna jsme."""
         if self.isFullScreen():
             self.showNormal()
-
-    def _cleanup_tempo_tmp(self):
-        try:
-            for p in list(self._tempo_tmp_paths):
-                try:
-                    if os.path.isfile(p) and p != (self._mixdown_tmp_path or ""):
-                        os.remove(p)
-                except Exception:
-                    pass
-                finally:
-                    self._tempo_tmp_paths.discard(p)
-        except Exception:
-            pass
-        self._tempo_cache.clear()
 
     def _apply_player_rate_or_render(self):
         """Tempo vždy vyrenderuj z originálu a pak přenačti přehrávání/mixdown."""
@@ -1458,27 +1728,24 @@ class MainWindow(QMainWindow):
         was_playing = self._transport_playing
         cur_ms = self._arr_time_ms
 
-        # render z originálu (žádné řetězení)
         try:
             try:
-                out_path = render_variant(src, tempo=rate)  # pokud tvoje verze umí pojmenovaný argument
+                out_path = render_variant(src, tempo=rate)
             except TypeError:
-                out_path = render_variant(src, rate)  # fallback na poziční
+                out_path = render_variant(src, rate)
         except Exception as e:
             QMessageBox.critical(self, "Tempo", f"Nepodařilo se změnit tempo:\n{e}")
             return
 
-        # ulož a ukliď starý tempo-render
         self._cleanup_tempo_tmp()
         self._tempo_tmp_path = out_path
 
-        # přizpůsob délku první "originální" buňky (bez cesty) tak, aby seděla vizuálně
         try:
             orig_ms = int(self._original_duration_ms or 0)
             new_ms = int(round(orig_ms / max(1e-6, rate)))
             changed = False
             for c in getattr(self.track_editor, "_cells", []):
-                if not c.path:  # první buňka odkazující na originál
+                if not c.path:
                     if c.duration_ms != new_ms:
                         c.duration_ms = new_ms
                         changed = True
@@ -1487,11 +1754,9 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # invaliduj signaturu a přerenderuj mixdown (už z nové tempo-varianty)
         self._mix_sig = ""
         self._ensure_mixdown_loaded(rebuild=True)
 
-        # vrátíme se na původní pozici a ukotvíme 1:1 čas
         self.on_seek_requested(cur_ms)
         if was_playing and not self.player.is_playing():
             self.player.play()
@@ -1500,44 +1765,35 @@ class MainWindow(QMainWindow):
             self._t_anchor_ms = self._arr_time_ms
 
     def _normalize_loudness(self, seg, *, target_lufs=-16.0, true_peak_limit_db=-1.0):
-        """
-        Vrátí segment srovnaný na jednotnou hlasitost.
-        1) Preferuje EBU R128 (pyloudnorm), jinak 2) fallback na dBFS (RMS) s headroomem.
-        """
-        # 1) EBU R128 (pokud je knihovna k dispozici)
         try:
             import pyloudnorm as pyln
             import numpy as _np
 
-            # pydub -> float32 (-1..1), shape: (n,) nebo (n, channels)
             arr = _np.array(seg.get_array_of_samples()).astype(_np.float32)
             peak = float(1 << (8 * seg.sample_width - 1))
             arr = arr / peak
             if seg.channels > 1:
                 arr = arr.reshape((-1, seg.channels))
 
-            meter = pyln.Meter(seg.frame_rate)  # EBU R128
+            meter = pyln.Meter(seg.frame_rate)
             lufs = meter.integrated_loudness(arr)
             gain_db = target_lufs - lufs
             seg = seg.apply_gain(gain_db)
 
-            # omez true-peak, ať nic neclipuje (ponecháme ~ -1 dBFS)
             try:
-                allowed_boost = true_peak_limit_db - seg.max_dBFS  # (-1) - (aktuální peak)
+                allowed_boost = true_peak_limit_db - seg.max_dBFS
                 if allowed_boost < 0:
-                    seg = seg.apply_gain(allowed_boost)  # záporný – lehce stáhneme
+                    seg = seg.apply_gain(allowed_boost)
             except Exception:
                 pass
             return seg
         except Exception:
             pass
 
-        # 2) Fallback: jednoduché RMS srovnání na cílové dBFS
-        target_dbfs = -16.0  # přibližně odpovídá -16 LUFS pro pop/EDM
+        target_dbfs = -16.0
         gain_db = target_dbfs - seg.dBFS
-        # pohlídej headroom (true peak ~ -1 dBFS)
         try:
-            allowed_boost = true_peak_limit_db - seg.max_dBFS  # např. -1 - (-3.2) = +2.2 dB
+            allowed_boost = true_peak_limit_db - seg.max_dBFS
             if gain_db > allowed_boost:
                 gain_db = allowed_boost
         except Exception:
@@ -1545,7 +1801,6 @@ class MainWindow(QMainWindow):
         return seg.apply_gain(gain_db)
 
     def _on_editor_loop_changed(self, a_ms: int, b_ms: int):
-        """Editor nahlásil změnu loopu → promítnout do přehrávače i timeline."""
         if a_ms < 0 or b_ms < 0:
             self.player.clear_loop()
             try:
@@ -1565,15 +1820,13 @@ class MainWindow(QMainWindow):
             pass
 
     def _mark_loop_start(self):
-        """Klávesa L – nastav A na aktuální playhead."""
         a = self._arr_time_ms
         _, b = self.track_editor.currentLoop()
         if b is None:
-            b = a  # vytvoř minimální platný rozsah
+            b = a
         self.track_editor.setLoopPoints(a, b)
 
     def _mark_loop_end(self):
-        """Shift+L – nastav B na aktuální playhead."""
         a, _ = self.track_editor.currentLoop()
         b = self._arr_time_ms
         if a is None:
@@ -1589,19 +1842,15 @@ class MainWindow(QMainWindow):
 
     def _on_cell_drag_started(self):
         self._editor_dragging = True
-        # během dragování necháme hrát starý mix, nerenderujeme
         self._rebuild_timer.stop()
 
     def _on_cell_drag_finished(self):
         self._editor_dragging = False
-        # po puštění myši rychle přerenderujeme a pokračujeme přesně z aktuální pozice
         self._rebuild_timer.start(10)
 
     def _do_rebuild_mixdown(self):
         cur = self._arr_time_ms
-        was_playing = self._transport_playing
 
-        # začínáme rebuild → pozastav tick i audio, ať nic „neskočí“ na 0
         self._rebuilding = True
         self._transport_timer.stop()
         try:
@@ -1610,11 +1859,9 @@ class MainWindow(QMainWindow):
         except AttributeError:
             self.player.stop()
 
-        # vynutit nový mix a nahrát jej (seek + případné play proběhne v _resume výše)
         self._mix_sig = ""
         self._ensure_mixdown_loaded(rebuild=True)
 
-        # UI hned nastav na vnímanou cílovou pozici (jen vizuálně, skutečné přehrání udělá _resume)
         tgt = min(cur, self._arr_total_ms)
         self.timeline.setPosition(tgt)
         self.track_editor.setPlayhead(tgt)
@@ -1631,7 +1878,6 @@ class MainWindow(QMainWindow):
                 old = self._segment_cache_order.pop(0)
                 self._segment_cache.pop(old, None)
         else:
-            # move to back (LRU)
             try:
                 self._segment_cache_order.remove(src_path)
             except ValueError:
@@ -1649,7 +1895,6 @@ class MainWindow(QMainWindow):
                     pass
                 finally:
                     self._tempo_tmp_paths.discard(p)
-                    # vyhoď i z cache
                     self._segment_cache.pop(p, None)
                     try:
                         self._segment_cache_order.remove(p)
@@ -1676,7 +1921,6 @@ class MainWindow(QMainWindow):
         if not target:
             return None
 
-        # title regexy
         syn = {
             "samba": [r"\bsamba\b"],
             "cha cha": [r"\bcha\b.*\bcha\b", r"\bchacha\b", r"\bcha-cha\b", r"\bcha\s*cha\b"],
@@ -1717,13 +1961,11 @@ class MainWindow(QMainWindow):
 
                 dur = int(getattr(t, "duration_ms", 0)) or probe_duration_ms(path)
 
-                # speciální pravidlo pro waltz/viennese podle tempa (pokud je k dispozici librosa)
                 if target in ("waltz", "viennese waltz") and librosa is not None:
                     try:
                         y, sr = librosa.load(path, sr=22050, mono=True, duration=45.0)
                         tempi = librosa.beat.tempo(y=y, sr=sr, aggregate=None)
                         bpm = float(_np.median(tempi)) if tempi is not None and len(tempi) else 0.0
-                        # hranice: <=35 → waltz, >=55 → viennese; jinak nechat projít oběma
                         if target == "waltz" and bpm >= 55.0:
                             continue
                         if target == "viennese waltz" and bpm <= 35.0:
@@ -1738,3 +1980,195 @@ class MainWindow(QMainWindow):
         if not cands:
             return None
         return random.choice(cands)
+
+    def _theme_store_path(self) -> str:
+        try:
+            lib_dir, _ = self.library.locations()
+            if lib_dir:
+                return os.path.join(lib_dir, "_theme.json")
+        except Exception:
+            pass
+        return os.path.join(tempfile.gettempdir(), "pm_theme.json")
+
+
+    def _load_theme_or_default(self) -> Theme:
+        default = Theme(mode="dark", accent=QColor("#D4AF37"))
+        p = self._theme_store_path()
+        try:
+            if os.path.isfile(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return Theme(
+                    mode=data.get("mode", "dark"),
+                    accent=QColor(data.get("accent", "#D4AF37"))
+                )
+        except Exception:
+            pass
+        return default
+
+    def _save_theme(self) -> None:
+        p = self._theme_store_path()
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"mode": self._theme.mode, "accent": self._theme.accent.name()}, f, indent=2)
+        except Exception:
+            pass
+
+    def _apply_theme(self, th: Theme) -> None:
+        app = QApplication.instance()
+        css = qss_for_theme(th)
+        if app:
+            app.setStyleSheet(css)
+        else:
+            self.setStyleSheet(css)
+
+        # role tlačítek
+        self.practice_btn.setProperty("pmRole", "primary")
+        self.playpause_btn.setProperty("pmRole", "primary")
+        self.delete_btn.setProperty("pmRole", "danger")
+
+        # custom paint widgets
+        try:
+            self.timeline.applyTheme(th)
+        except Exception:
+            pass
+        try:
+            self.track_editor.applyTheme(th)
+        except Exception:
+            pass
+
+        # overlays jsou QColor -> vždy přepočítat
+        try:
+            self._recompute_total_and_overlays()
+        except Exception:
+            pass
+
+        for w in (self.practice_btn, self.playpause_btn, self.delete_btn):
+            try:
+                w.style().unpolish(w)
+                w.style().polish(w)
+            except Exception:
+                pass
+            w.update()
+
+
+    def _install_theme_menu(self) -> None:
+        m = self.menuBar().addMenu("Vzhled")
+
+        act_dark = QAction("Pozadí: Dark", self, checkable=True)
+        act_light = QAction("Pozadí: Light", self, checkable=True)
+
+        def sync_checks():
+            act_dark.setChecked(self._theme.mode == "dark")
+            act_light.setChecked(self._theme.mode == "light")
+        sync_checks()
+
+        def set_mode(mode: str):
+            self._theme.mode = mode
+            self._apply_theme(self._theme)
+            self._save_theme()
+            sync_checks()
+
+        act_dark.triggered.connect(lambda: set_mode("dark"))
+        act_light.triggered.connect(lambda: set_mode("light"))
+
+        m.addAction(act_dark)
+        m.addAction(act_light)
+        m.addSeparator()
+
+        def set_accent(hex_color: str):
+            self._theme.accent = QColor(hex_color)
+            self._apply_theme(self._theme)
+            self._save_theme()
+
+        m.addAction(QAction("Accent: Gold", self, triggered=lambda: set_accent("#D4AF37")))
+        m.addAction(QAction("Accent: Red", self, triggered=lambda: set_accent("#FF2A2A")))
+        m.addAction(QAction("Accent: Purple", self, triggered=lambda: set_accent("#8A2BE2")))
+        m.addAction(QAction("Accent: Blue", self, triggered=lambda: set_accent("#0575E5")))
+
+        def pick_custom():
+            col = QColorDialog.getColor(self._theme.accent, self, "Vyber accent barvu")
+            if col.isValid():
+                self._theme.accent = col
+                self._apply_theme(self._theme)
+                self._save_theme()
+
+        m.addAction(QAction("Accent: Vlastní…", self, triggered=pick_custom))
+
+    def _install_export_menu(self) -> None:
+        mb = self.menuBar()
+        m = mb.addMenu("Soubor")
+
+        act_export = QAction("Exportovat mix…", self)
+        act_export.setShortcut("Ctrl+E")
+        act_export.triggered.connect(self.export_mixdown)
+        m.addAction(act_export)
+
+    def export_mixdown(self) -> None:
+        """
+        Exportuje aktuální aranž (mixdown) do WAV/MP3/FLAC.
+        Respektuje CUT (src_in_ms) + efekty (fade/gain/echo) = co máš v renderu.
+        """
+        # vynutit nový mix (ať je to vždy aktuální)
+        try:
+            self._ensure_mixdown_loaded(rebuild=True)
+        except Exception:
+            # fallback: když to spadne, aspoň se pokusíme vyrenderovat přímo
+            try:
+                self._render_arrangement_to_temp_wav()
+            except Exception as e:
+                QMessageBox.critical(self, "Export", f"Nepodařilo se vytvořit mix:\n{e}")
+                return
+
+        src = self._mixdown_tmp_path
+        if not src or not os.path.isfile(src):
+            QMessageBox.warning(self, "Export", "Mixdown není k dispozici (nejdřív něco poskládej).")
+            return
+
+        default_name = "PracticeMaster_Mix.wav"
+        out_path, flt = QFileDialog.getSaveFileName(
+            self,
+            "Export mixu",
+            default_name,
+            "WAV (*.wav);;MP3 (*.mp3);;FLAC (*.flac)"
+        )
+        if not out_path:
+            return
+
+        ext = os.path.splitext(out_path)[1].lower().strip()
+        if ext not in (".wav", ".mp3", ".flac"):
+            # když uživatel nenapíše příponu, doplň podle filtru
+            if "MP3" in flt:
+                out_path += ".mp3"
+                ext = ".mp3"
+            elif "FLAC" in flt:
+                out_path += ".flac"
+                ext = ".flac"
+            else:
+                out_path += ".wav"
+                ext = ".wav"
+
+        try:
+            if ext == ".wav":
+                shutil.copyfile(src, out_path)
+
+            else:
+                # MP3/FLAC přes pydub (FFmpeg musí být v PATH)
+                from pydub import AudioSegment
+                seg = AudioSegment.from_file(src)
+
+                if ext == ".mp3":
+                    seg.export(out_path, format="mp3", bitrate="192k")
+                elif ext == ".flac":
+                    seg.export(out_path, format="flac")
+
+            QMessageBox.information(self, "Export hotový", f"Uloženo:\n{out_path}")
+
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Export selhal",
+                "Export se nepodařil.\n"
+                "Zkontroluj, že máš FFmpeg v PATH (pro MP3/FLAC).\n\n"
+                f"Chyba: {e}"
+            )

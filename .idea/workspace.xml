@@ -5,15 +5,11 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="563ca7a4-b125-41c9-b2b5-90b60074cc9d" name="Changes" comment="funguje editor s přidáváním více buňek, a hýbání s nimi, také se aplikace otevírá přes celé okno">
-      <change afterPath="$PROJECT_DIR$/src/ml/labels_index.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/src/ml/segment.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/src/ui/theme.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/app.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/app.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/ml/features.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ml/features.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/ml/infer.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ml/infer.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/ml/train.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ml/train.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/ui/main_window.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/main_window.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/ui/timeline.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/timeline.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/ui/track_editor.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/track_editor.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -31,10 +27,11 @@
   <component name="Git.Settings">
     <option name="RECENT_BRANCH_BY_REPOSITORY">
       <map>
-        <entry key="$PROJECT_DIR$" value="upravy" />
+        <entry key="$PROJECT_DIR$" value="main" />
       </map>
     </option>
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+    <option name="RESET_MODE" value="MIXED" />
   </component>
   <component name="GitHubPullRequestSearchHistory">{
   &quot;lastFilter&quot;: {
@@ -61,6 +58,7 @@
     &quot;ASKED_SHARE_PROJECT_CONFIGURATION_FILES&quot;: &quot;true&quot;,
     &quot;Node.js.main.js.executor&quot;: &quot;Run&quot;,
     &quot;Python.app.executor&quot;: &quot;Run&quot;,
+    &quot;Python.main_window.executor&quot;: &quot;Run&quot;,
     &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
     &quot;git-widget-placeholder&quot;: &quot;upravy&quot;,
@@ -132,6 +130,12 @@
       <workItem from="1762773721488" duration="622000" />
       <workItem from="1762847965144" duration="23577000" />
       <workItem from="1762946997985" duration="3551000" />
+      <workItem from="1765394577126" duration="1012000" />
+      <workItem from="1765871993903" duration="4273000" />
+      <workItem from="1765974029195" duration="3193000" />
+      <workItem from="1766143706398" duration="843000" />
+      <workItem from="1766683339925" duration="1189000" />
+      <workItem from="1766837134197" duration="2491000" />
     </task>
     <task id="LOCAL-00001" summary="test">
       <option name="closed" value="true" />
@@ -218,6 +222,17 @@
   </component>
   <component name="TypeScriptGeneratedFilesManager">
     <option name="version" value="3" />
+  </component>
+  <component name="Vcs.Log.History.Properties">
+    <option name="COLUMN_ID_ORDER">
+      <list>
+        <option value="Default.Root" />
+        <option value="Default.Author" />
+        <option value="Default.Date" />
+        <option value="Default.Subject" />
+        <option value="GitHub.CommitStatus" />
+      </list>
+    </option>
   </component>
   <component name="Vcs.Log.Tabs.Properties">
     <option name="TAB_STATES">
