@@ -4,12 +4,8 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="563ca7a4-b125-41c9-b2b5-90b60074cc9d" name="Changes" comment="funguje editor s přidáváním více buňek, a hýbání s nimi, také se aplikace otevírá přes celé okno">
-      <change afterPath="$PROJECT_DIR$/src/ui/theme.py" afterDir="false" />
+    <list default="true" id="563ca7a4-b125-41c9-b2b5-90b60074cc9d" name="Changes" comment="funkční tempo pro každou buňku editoru zvlášť">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/ui/main_window.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/main_window.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/ui/timeline.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/timeline.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/ui/track_editor.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/track_editor.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -61,7 +57,7 @@
     &quot;Python.main_window.executor&quot;: &quot;Run&quot;,
     &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;upravy&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;master&quot;,
     &quot;last_opened_file_path&quot;: &quot;D:/projekty/Hudba/music-editor/.venv&quot;,
     &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
     &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
@@ -136,6 +132,8 @@
       <workItem from="1766143706398" duration="843000" />
       <workItem from="1766683339925" duration="1189000" />
       <workItem from="1766837134197" duration="2491000" />
+      <workItem from="1767365548556" duration="722000" />
+      <workItem from="1767536013456" duration="1070000" />
     </task>
     <task id="LOCAL-00001" summary="test">
       <option name="closed" value="true" />

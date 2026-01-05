@@ -43,6 +43,12 @@
 \makeatletter
 \makeatother                    
 \usepackage[czech]{babel}
+\hyphenation{apli-ka-ce}
+\hyphenation{pra-zmas}
+\clubpenalty=10000
+\widowpenalty=10000
+\tolerance=2000
+\finalhyphendemerits=5000
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage{cmap}
@@ -60,8 +66,8 @@
 \usepackage{tocloft}
 \setlength{\cftbeforechapskip}{0pt}
 \setlength{\cftbeforesecskip}{0pt}
-\setcounter{secnumdepth}{2}
-\setcounter{tocdepth}{1}
+\setcounter{secnumdepth}{3}
+\setcounter{tocdepth}{3}
 
 \usepackage{fancyhdr}
 \pagestyle{fancy}
@@ -109,7 +115,6 @@
 % ===================== DOKUMENT =====================
 
 \begin{document}
-\raggedright 
 
 \pagestyle{empty}
 \pagenumbering{Roman}
@@ -223,8 +228,9 @@ Z vlastní zkušenosti z tréninků vyplynulo, že současné řešení práce s
 
 Vyzkoušené nástroje, jako jsou běžné systémové přehrávače (například Windows Media Player nebo VLC), případně univerzální programy pro přehrávání hudby, fungují dobře jako klasické přehrávače, ale nenabízejí funkce potřebné pro taneční tréninky. Neumožňují náhodné skládání nových prakticů z knihovny skladeb, neumějí pracovat s tanečními styly ani neumí jednoduše změnit tempo tak, aby se daly skladby přizpůsobit konkrétnímu tréninkovému plánu. Z tohoto důvodu se ukázalo jako vhodné navrhnout vlastní nástroj zaměřený přímo na potřeby trenérů a tanečníků.
 
-Při návrhu ideálního řešení byl kladen důraz na to, aby bylo možné připravit nebo spustit practice v několika málo krocích. Trenér by měl mít k dispozici jedno hlavní okno s knihovnou skladeb, editorem timeline a viditelnými ovládacími prvky pro tempo, hlasitost a loop. Původní myšlenkou bylo vytvořit webovou aplikaci, ale s ohledem na potřebu spolehlivého přehrávání zvuku, nižší latence a nezávislosti na internetovém připojení padla volba na offline desktopovou aplikaci pro Windows, kterou lze v případě potřeby buildnout i pro Linux.
+Při návrhu ideálního řešení byl kladen důraz na to, aby bylo možné připravit nebo spustit practice v několika málo krocích. Trenér by měl mít k dispozici jedno hlavní okno s knihovnou skladeb, editorem timeline a viditelnými ovládacími prvky pro tempo, hlasitost a loop. Původní myšlenkou bylo vytvořit webovou aplikaci, ale s ohledem na potřebu spolehlivého přehrávání zvuku, nižší latence a nezávislosti na internetovém připojení padla volba na offline desktopovou aplikaci pro Windows, kterou lze v~případě potřeby buildnout i pro Linux.
 
+\newpage
 \section{Cíle práce}
 
 Hlavním cílem projektu je navrhnout a implementovat desktopovou aplikaci \textit{prazmas}, která zjednoduší přípravu a přehrávání tréninkových hudebních mixů. Z tohoto obecného cíle vyplývají dílčí cíle:
@@ -247,8 +253,16 @@ Tato kapitola popisuje technologie a knihovny, na kterých je aplikace \textit{p
 
 Jako hlavní programovací jazyk byl zvolen Python. Aplikace \textit{prazmas} je vyvíjena a provozována v prostředí Python~3.12.10 na 64bitové platformě Windows, spuštěné v odděleném virtuálním prostředí projektu. Tato verze poskytuje moderní jazykové konstrukce, bohatý ekosystém knihoven pro práci se zvukem, GUI i strojové učení a zároveň je kompatibilní s použitými externími moduly.
 
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.5\textwidth]{image/pyqt6-logo.png}
+  \caption{knihovna PyQt6.}
+  \label{fig:pyqt6-logo.png}
+\end{figure}
+
 Grafické uživatelské rozhraní je postaveno na knihovně PyQt6, což je vazba na toolkit Qt určený pro tvorbu multiplatformních GUI aplikací. PyQt6 poskytuje širokou škálu widgetů, správu layoutů, práci s událostmi a časovači, což je v \textit{prazmas} využito například pro vykreslování waveformu, správu časové osy a ovládání přehrávání. Hlavní okno aplikace je implementováno ve třídě \texttt{MainWindow}, která dědí od \texttt{QMainWindow} a vytváří kompletní rozložení UI včetně knihovny skladeb, timeline, editoru buněk a ovládacích prvků přehrávání.
 
+\newpage
 \section{Práce se zvukem: pydub, FFmpeg a vlastní audio vrstva}
 
 Základní zpracování zvuku, jako je načítání audio souborů, dělení na úseky, aplikace efektů a renderování výsledného mixu, je řešeno pomocí knihovny \texttt{pydub}. Pydub poskytuje vysokou úroveň abstrakce nad audiem – umožňuje jednoduše číst soubory přes FFmpeg, skládat je za sebe, překrývat, aplikovat fade-in a fade-out nebo měnit hlasitost. V aplikaci \textit{prazmas} se pydub používá například při generování practice mixů a při exportu výsledného aranžmá do dočasného WAV souboru.
@@ -263,13 +277,38 @@ Aplikace \textit{prazmas} obsahuje dvě klíčové grafické komponenty pro prá
 
 \subsection{TimelineWidget}
 
-Třída \texttt{TimelineWidget} se stará o zobrazení průběhu celého aranžmá v čase. Zobrazuje horizontální osu s časovým měřítkem, waveform výsledného mixu a polohu přehrávací hlavy. Uživatel může kliknutím na časovou osu měnit pozici přehrávání, případně nastavovat oblast loopu pomocí dvou značek (A/B). Widget také emituje signály \texttt{seekRequested}, \texttt{loopAChanged}, \texttt{loopBChanged} a \texttt{clearLoopRequested}, na které \texttt{MainWindow} reaguje aktualizací stavu přehrávače a editoru.
+Třída \texttt{TimelineWidget} se stará o zobrazení průběhu celého aranžmá v čase. 
+Zobrazuje horizontální osu s časovým měřítkem, waveform výsledného mixu a polohu přehrávací hlavy. 
+Uživatel může kliknutím na časovou osu měnit pozici přehrávání, 
+případně nastavovat oblast loopu pomocí dvou značek (A/B), jak je vidět na obr.~\ref{fig:timeline-loop}. 
+Widget také emituje signály \texttt{seekRequested}, \texttt{loopAChanged}, \texttt{loopBChanged} 
+a \texttt{clearLoopRequested}, na které \texttt{MainWindow} reaguje aktualizací stavu přehrávače a editoru.
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.85\textwidth]{image/timeline-loop.png}
+  \caption{Timeline s aktivním A/B loopem (červené značky), přehrávací hlavou (žlutá čára) 
+  a zoomovaným měřítkem pro přesné nastavení.}
+  \label{fig:timeline-loop}
+\end{figure}
 
 \subsection{TrackEditorWidget a struktura Cell}
 
 Základem pro skládání hudby je třída \texttt{TrackEditorWidget}, která zobrazuje jednotlivé úseky (buňky) na více „lanech“ v horizontálním čase. Každá buňka je reprezentována datovou strukturou \texttt{Cell}, definovanou jako dataclass se základními parametry: číslo lane, offset v milisekundách, délka, cesta k souboru, titulek, waveform, přirozená délka v původním tempu, aktuální tempo, fade-in a fade-out, zisk v decibelech a parametry echo efektu.
 
-\texttt{TrackEditorWidget} umožňuje buňky horizontálně a vertikálně posouvat, kopírovat a dělit. Pomocí kontextového menu lze na vybranou buňku aplikovat efekty (gain, fade-in, fade-out a echo), nebo buňku rozdělit na dvě části v zadaném čase. Widget také podporuje přetahování souborů z operačního systému a položek z knihovny skladeb – při dropu vytvoří novou buňku s odpovídajícím waveformem a délkou. Při každé změně aranžmá vysílá signál \texttt{arrangementChanged}, na který hlavní okno reaguje přepočtem celkové délky a přípravou mixdownu.
+\texttt{TrackEditorWidget} umožňuje buňky horizontálně a vertikálně posouvat, 
+kopírovat a dělit. Pomocí kontextového menu (obr.~\ref{fig:editor-menu}) lze na vybranou 
+buňku aplikovat efekty (gain, fade-in, fade-out a echo), nebo buňku rozdělit na dvě části 
+v zadaném čase.
+ Widget také podporuje přetahování souborů z operačního systému a položek z knihovny skladeb – při dropu vytvoří novou buňku s odpovídajícím waveformem a délkou. Při každé změně aranžmá vysílá signál \texttt{arrangementChanged}, na který hlavní okno reaguje přepočtem celkové délky a přípravou mixdownu.
+
+ \begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.7\textwidth]{image/editor-bunka-menu.png}
+  \caption{Kontextové menu buňky s možnostmi ``Cut at playhead'', ``Echo effect'', 
+  ``Fade-in/out'' a nastavením gain.}
+  \label{fig:editor-menu}
+\end{figure}
 
 \section{AI modul pro rozpoznávání tanečních stylů}
 
@@ -279,7 +318,15 @@ Modul \texttt{features.py} obsahuje funkce pro extrakci příznaků ze zvuku –
 
 Trénování modelu je řešeno v souboru \texttt{train.py}, kde se na základě anotovaných zvukových ukázek jednotlivých tanců vytvoří klasifikátor rozlišující jednotlivé styly. Seznam podporovaných štítků a jejich indexů je udržován v modulu \texttt{labels\_index.py}, který zajišťuje konzistenci mezi tréninkem a inferencí. Pro automatické labelování dat může sloužit pomocný skript \texttt{auto\_label.py}.
 
-V samotné aplikaci je AI modul zapouzdřen ve třídě \texttt{DanceAI} v souboru \texttt{infer.py}. Tato třída poskytuje metody \texttt{predict} a \texttt{predict\_proba\_all}, které na základě vstupního audio souboru vrátí jednak nejpravděpodobnější taneční styl, jednak rozložení pravděpodobností přes všechny styly. Výsledek se v UI zobrazuje jako tabulka procent, která dohromady tvoří 100\,\%, doplněná odhadem BPM. Uživatel tak může okamžitě zkontrolovat, zda skladba odpovídá například sambě, chachě, rumbě nebo standardním tancům.
+V samotné aplikaci je AI modul zapouzdřen ve třídě \texttt{DanceAI} v souboru \texttt{infer.py}. Tato třída poskytuje metody \texttt{predict} a \texttt{predict\_proba\_all}, které na základě vstupního audio souboru vrátí jednak nejpravděpodobnější taneční styl, jednak rozložení pravděpodobností přes všechny styly. Výsledek se v UI zobrazuje jako tabulka procent (obr.~\ref{fig:ai-analyza}), 
+která dohromady tvoří 100\,\%, doplněná odhadem BPM. Uživatel tak může okamžitě zkontrolovat, zda skladba odpovídá například sambě, chachě, rumbě nebo standardním tancům.
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.6\textwidth]{image/ai-analyza.png}
+  \caption{AI analýza skladby: Cha-Cha 98,7\,\%, Samba 1,1\,\%, BPM 123.}
+  \label{fig:ai-analyza}
+\end{figure}
 
 \section{Knihovna skladeb a správa souborů}
 
@@ -291,7 +338,15 @@ Aplikace také podporuje ukládání a obnovu stavu knihovny, včetně jednoduch
 
 \section{Vlastní vzhled a ovládací prvky}
 
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.5\textwidth]{image/theme-dialog.png}
+  \caption{Dialog výběru barevného motivu aplikace.}
+  \label{fig:theme-dialog.png}
+\end{figure}
+
 Pro sjednocení vzhledu aplikace a možnost přepínání motivů je vytvořen modul \texttt{ui.theme}. Ten definuje třídu \texttt{Theme} s parametry jako barevný režim (světlý/tmavý) a akcentová barva a rovněž generuje odpovídající Qt Style Sheet (QSS). Hlavní okno umí téma načíst, uložit do souboru a aplikovat na celou aplikaci; zároveň obsahuje menu pro přepínání motivu a výběr akcentové barvy. Speciální widgety jako \texttt{TimelineWidget} a \texttt{TrackEditorWidget} dokáží motiv převzít a podle něj upravit barvy gridu, waveformu a buněk.
+
 
 Mezi vlastní ovládací prvky patří také widget \texttt{PlayPauseButton}, který zabalí logiku přehrávání do jednoho přepínacího tlačítka s ikonou a stavem. V kombinaci s \texttt{WinMediaKeyFilter} je možné reagovat i na systémové multimediální klávesy, takže uživatel může pauzovat a spouštět přehrávání přímo z klávesnice nebo z ovladače připojeného k počítači.
 
@@ -333,8 +388,8 @@ Na obrázku~\ref{fig:prazmas-main} je vidět typická situace při editaci delš
   \caption{Hlavní okno aplikace \textit{prazmas} s knihovnou skladeb, timeline a editorem buněk během vytváření mixu.}
   \label{fig:prazmas-main}
 \end{figure}
-\newpage
 
+\newpage
 \section{Architektura aplikace}
 
 Na úrovni architektury je aplikace rozdělena na několik hlavních částí, které spolu komunikují přes jasně definovaná rozhraní. V centru stojí třída \texttt{MainWindow}, která propojuje uživatelské rozhraní s logikou přehrávání a generování mixů. \texttt{MainWindow} vlastní instanci třídy \texttt{AudioPlayer} zodpovědné za nízkoúrovňové přehrávání zvuku, instanci \texttt{TimelineWidget} pro zobrazení průběhu mixu a instanci \texttt{TrackEditorWidget} pro práci s jednotlivými buňkami.
@@ -352,7 +407,15 @@ Timeline nad editorem zobrazuje průběh celého mixu jako waveform a zároveň 
 
 \section{Generování practice mixů}
 
-Součástí aplikace \textit{prazmas} je průvodce pro automatické generování practice mixů, který má trenérům ušetřit čas při přípravě tréninkových bloků. Při spuštění generování uživatel zadá několik parametrů: délku jednoho tance, délku pauzy mezi jednotlivými tanci, volbu typu sekvence (standardní \mbox{STT} nebo latinské \mbox{LAT}) a možnost, zda se má hotový mix uložit do knihovny pro pozdější znovupoužití.
+Součástí aplikace \textit{prazmas} je průvodce pro automatické generování practice mixů, který má trenérům ušetřit čas při přípravě tréninkových bloků. Při spuštění generování uživatel zadá parametry v dialogu (obr.~\ref{fig:practice-dialog}): 
+délku jednoho tance, délku pauzy mezi jednotlivými tanci, volbu typu sekvence (standardní \mbox{STT} nebo latinské \mbox{LAT}) a možnost, zda se má hotový mix uložit do knihovny pro pozdější znovupoužití.
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.5\textwidth]{image/practice-dialog.png}
+  \caption{Dialog automatického generování practicu.}
+  \label{fig:practice-dialog}
+\end{figure}
 
 Typ tance je v aplikaci reprezentován pevně danými skupinami. Pro latinské tance (\mbox{LAT}) se pracuje s pěticí samba, cha‑cha, rumba, paso doble a jive, zatímco standardní skupina (\mbox{STT}) zahrnuje waltz, tango, viennese waltz, slowfox a quickstep. Pro zvolený typ aplikace vytvoří sekvenci tanců v daném pořadí a ke každému tanci se pokouší najít vhodnou skladbu z lokální knihovny, která splňuje požadovanou délku a styl.
 
@@ -365,7 +428,7 @@ Jakmile jsou pro celou sekvenci tanců vybrány odpovídající skladby, aplikac
 Jakmile je practice mix v editoru hotový, je potřeba převést celé aranžmá do jednoho souboru, který lze přehrát i mimo aplikaci. Tuto funkci zajišťuje mixdown pipeline využívající kombinaci editoru buněk, pomocného modulu \texttt{audio.processing} a externího nástroje FFmpeg. Nejprve \texttt{TrackEditorWidget} spočítá celkovou délku aranžmá a připraví seznam všech buněk včetně jejich offsetu, tempa, efektů a referencí na zdrojové soubory. Následně modul \texttt{audio.processing} postupně skládá jednotlivé úseky do jednoho audio streamu – aplikuje nastavené tempo, gain, fade‑in a fade‑out a případný echo efekt, a to s využitím knihovny pydub.
 
 Pro dekódování vstupních souborů a výslednou konverzi do cílového formátu je použit FFmpeg, který se stará o podporu různých typů vstupních souborů i o správné kódování výstupu. Základním výstupním formátem je nekomprimovaný WAV, aby nedocházelo ke ztrátě kvality při dalších úpravách. Podle zvolených parametrů může aplikace výsledný mix následně překódovat také do ztrátového formátu MP3 nebo bezeztrátového FLAC, což je vhodné pro běžné použití na tréninzích a přenos mezi zařízeními. Uživatel má možnost uložit mix přímo do knihovny aplikace, nebo vybrat libovolné umístění na disku.
-
+\newpage
 \section{Testování funkcí aplikace}
 
 Při vývoji aplikace \textit{prazmas} bylo testování zaměřeno hlavně na stabilitu přehrávání, správnou práci s časem a ověření chování editoru při typických scénářích práce trenéra. Testování probíhalo průběžně během vývoje formou manuálních testů na několika projektech, které kombinovaly různé délky skladeb, změny tempa a více buněk na různých lanech. Zvláštní pozornost byla věnována plynulosti přehrávání při posouvání přehrávací hlavy, vypínání a zapínání loopu a přepínání skladeb v režimu \emph{Autoplay}.
@@ -379,22 +442,23 @@ Tato sekce stručně popisuje typický postup práce s aplikací \textit{prazmas
 \subsection*{Import skladeb do knihovny}
 
 Uživatel nejprve otevře aplikaci a v levém panelu knihovny použije tlačítko \emph{Import}. V zobrazeném dialogu vybere jednu nebo více audio stop z disku a potvrdí jejich přidání. Aplikace uloží informace o souborech do interní databáze a v seznamu knihovny se zobrazí nové položky s názvem souboru a základními údaji o délce. Pokud jsou některé soubory později přesunuty nebo smazány, lze pomocí tlačítek \emph{Opravit} a \emph{Relink} knihovnu zkontrolovat a chybějící cesty znovu nastavit.
-
+\newpage
 \subsection*{Ruční vytvoření practice mixu}
 
 Pro ruční vytvoření practice mixu uživatel přetáhne vybrané skladby z knihovny do editoru buněk v pravé části okna. Každé přetažení vytvoří novou buňku, kterou lze myší posouvat po časové ose, přesouvat na jiný lane a kopírovat. Kontextové menu umožňuje buňku rozdělit na dvě části, upravit hlasitost a nastavit fade‑in nebo fade‑out, případně zapnout echo efekt. Uživatel si tak může poskládat libovolnou kombinaci úseků a přizpůsobit jejich délku a efekty podle potřeby tréninku. 
-\newpage
+
 \subsection*{Automatické generování mixu}
 
 Pokud chce uživatel využít automatické generování practice mixu, otevře příslušný dialog a zadá základní parametry: typ sekvence (standardní STT nebo latinské LAT), délku jednoho tance a délku pauzy mezi tanci. Volitelně může zvolit, zda se má výsledný mix uložit do knihovny. Aplikace následně projde lokální knihovnu skladeb, pro každý tanec vybere vhodné kandidáty a pomocí AI modulu ověří, zda hudba odpovídá požadovanému stylu. Výsledný blok se automaticky naplní do editoru buněk, kde jej lze dále ručně upravovat.
 
-\subsection*{Uložení projektu a export mixu}
 
-Jakmile je mix hotový, může uživatel projekt uložit, aby se k němu později mohl vrátit. K tomu slouží volby v hlavním menu, které uloží rozložení buněk a nastavení do projektového souboru. Pro použití mimo aplikaci se využije funkce \emph{Export}, která provede mixdown a uloží výsledný soubor jako WAV; podle nastavení může být následně překódován do MP3 nebo FLAC. Exportovaný soubor lze přenést na jiné zařízení nebo použít v běžném přehrávači na tréninku.
+\subsection*{export mixu}
+
+Jakmile je mix hotový, může uživatel projekt exportovat. Pro použití se využije funkce \emph{Export}, která provede mixdown a uloží výsledný soubor jako WAV; podle nastavení může být následně překódován do MP3 nebo FLAC. Exportovaný soubor lze přenést na jiné zařízení nebo použít v běžném přehrávači na tréninku.
 
 \section{Zhodnocení splněných cílů}
 
-V úvodní části práce byly stanoveny cíle, které měla aplikace \textit{prazmas} splnit. V průběhu vývoje se podařilo realizovat všechny klíčové funkce: uživatel může vytvářet practice mixy z libovolných skladeb v lokální knihovně, pracovat s časovou osou a více buňkami, měnit tempo, aplikovat základní efekty a využít automatické generování sekvencí pro standardní i latinské tance. Implementovaný AI modul dokáže pro každou skladbu odhadnout dominantní taneční styl a přibližné BPM, což usnadňuje kontrolu vhodnosti hudby pro daný typ tréninku. 
+V úvodní části práce byly stanoveny cíle, které měla aplikace \textit{prazmas} splnit. V průběhu vývoje se podařilo realizovat všechny klíčové funkce: uživatel může vytvářet practice mixy z~libovolných skladeb v lokální knihovně, pracovat s časovou osou a více buňkami, měnit tempo, aplikovat základní efekty a využít automatické generování sekvencí pro standardní i latinské tance. Implementovaný AI modul dokáže pro každou skladbu odhadnout dominantní taneční styl a přibližné BPM, což usnadňuje kontrolu vhodnosti hudby pro daný typ tréninku. 
 
 Aplikace splňuje i praktické požadavky na použití v tréninkovém prostředí: běží jako samostatný desktopový program bez závislosti na internetu, podporuje ovládání pomocí multimediálních kláves a tlačítek na bezdrátových sluchátkách a umožňuje export hotových mixů do běžných formátů. Některé oblasti zůstávají otevřené pro budoucí rozšíření, například pokročilejší správa projektů, sdílení presetů practice bloků mezi uživateli nebo integrace s online databázemi hudby. Z hlediska původně vytyčených cílových požadavků však lze projekt považovat za úspěšně realizovaný funkční prototyp, který je připravený k reálnému nasazení na trénincích.
 
@@ -412,48 +476,47 @@ Do budoucna lze rozšířit například pokročilou správu projektů s verzová
 
 
 % ---------- LITERATURA ----------
-% ---------- LITERATURA ----------
 \begin{thebibliography}{99}
 
 \bibitem{pyqt6}
-Qt for Python Documentation, ``PyQt6 Reference Guide'',
-\url{https://www.riverbankcomputing.com/static/Docs/PyQt6/},
-2024. 
+Riverbank Computing, ``PyQt6 Reference Guide'', 
+\url{https://www.riverbankcomputing.com/static/Docs/PyQt6/}, 
+cit. 4.~1.~2026.
 
 \bibitem{pydub}
-Jiaaro, ``pydub - Simple audio libraries for Python'',
-\url{https://github.com/jiaaro/pydub},
-2024.
+Jiaaro, ``pydub - Simple audio libraries for Python'', 
+\url{https://github.com/jiaaro/pydub}, 
+cit. 4.~1.~2026.
 
 \bibitem{ffmpeg}
-FFmpeg Project, ``FFmpeg Documentation'',
-\url{https://ffmpeg.org/documentation.html},
-2024.
+FFmpeg Project, ``FFmpeg Documentation'', 
+\url{https://ffmpeg.org/documentation.html}, 
+cit. 4.~1.~2026.
 
 \bibitem{python312}
-Python Software Foundation, ``Python 3.12 Documentation'',
-\url{https://docs.python.org/3.12/},
-2024.
+Python Software Foundation, ``Python 3.12 Documentation'', 
+\url{https://docs.python.org/3.12/}, 
+cit. 4.~1.~2026.
 
 \bibitem{librosa}
-McFee, B. et al., ``librosa: Audio and Music Signal Analysis in Python'',
-\url{https://librosa.org/doc/latest/index.html},
-2024.
+McFee, B. et al., ``librosa: Audio and Music Signal Analysis in Python'', 
+\url{https://librosa.org/doc/latest/index.html}, 
+cit. 4.~1.~2026.
 
 \bibitem{scipy}
-Virtanen, P. et al., ``SciPy 1.0: Fundamental Algorithms for Scientific Computing in Python'',
-\url{https://docs.scipy.org/doc/scipy/reference/},
+Virtanen, P. et al., ``SciPy 1.0: Fundamental Algorithms for Scientific Computing in Python'', 
+\url{https://docs.scipy.org/doc/scipy/reference/}, 
 2018.
 
 \bibitem{pyqt6-designer}
-Riverbank Computing Limited, ``Qt Designer Manual'',
-\url{https://doc.qt.io/qt-6/qtdesigner-manual.html},
-2024.
+The Qt Company, ``Qt Designer Manual'', 
+\url{https://doc.qt.io/qt-6/qtdesigner-manual.html}, 
+cit. 4.~1.~2026.
 
 \bibitem{qt-audio}
-The Qt Company, ``Qt Multimedia Overview'',
-\url{https://doc.qt.io/qt-6/qtmultimedia-index.html},
-2024.
+The Qt Company, ``Qt Multimedia Overview'', 
+\url{https://doc.qt.io/qt-6/qtmultimedia-index.html}, 
+cit. 4.~1.~2026.
 
 \end{thebibliography}
 
