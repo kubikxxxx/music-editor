@@ -19,35 +19,35 @@
 
 ### ✅ Červen
 - [x] Definice funkcí a specifikace projektu
-- [ ] Nastavení vývojového prostředí (Python, knihovny, virtualenv)
-- [ ] Založení Git repozitáře
-- [ ] Zkušební přehrání MP3/WAV přes PyQt6 + QtMultimedia
-- [ ] Testování změny tempa pomocí `ffmpeg-python`
+- [x] Nastavení vývojového prostředí (Python, knihovny, virtualenv)
+- [x] Založení Git repozitáře
+- [x] Zkušební přehrání MP3/WAV přes PyQt6 + QtMultimedia
+- [x] Testování změny tempa pomocí `ffmpeg-python`
 - [ ] Průzkum datasetů pro klasifikaci stylů (např. GTZAN)
 
 ---
 
 ### ✅ Srpen
-- [ ] Základní GUI v PyQt6 – načtení souboru, přehrávání, slider
-- [ ] Zpomalení/zrychlení přes ffmpeg (bez změny výšky)
-- [ ] Loop – nastavení začátku a konce smyčky
+- [x] Základní GUI v PyQt6 – načtení souboru, přehrávání, slider
+- [x] Zpomalení/zrychlení přes ffmpeg (bez změny výšky)
+- [x] Loop – nastavení začátku a konce smyčky
 - [ ] Základní logování a error handling
 - [ ] Ukládání nastavení do JSON/SQLite
 
 ---
 
 ### ✅ Září
-- [ ] Detekce tempa a beatů (`librosa`)
-- [ ] Sběr trénovacích dat (100–300 skladeb s popisky stylu)
+- [x] Detekce tempa a beatů (`librosa`)
+- [x] Sběr trénovacích dat (100–300 skladeb s popisky stylu)
 - [ ] Vytvoření mel-spectrogramů (`librosa`)
-- [ ] Trénování klasifikačního modelu (Keras, scikit-learn)
-- [ ] Uložení modelu pomocí `pickle`
+- [x] Trénování klasifikačního modelu (Keras, scikit-learn)
+- [x] Uložení modelu pomocí `pickle`
 
 ---
 
 ### ✅ Říjen
-- [ ] Integrace AI modelu do GUI
-- [ ] Zobrazení BPM a rozpoznaného stylu
+- [x] Integrace AI modelu do GUI
+- [x] Zobrazení BPM a rozpoznaného stylu
 - [ ] Automatická úprava tempa podle tanečního stylu
 - [ ] Pokročilé GUI (volba stylu, konfigurační panel)
 - [ ] Optimalizace výkonu a UX testování
@@ -55,18 +55,18 @@
 ---
 
 ### ✅ Listopad
-- [ ] Export výsledného tracku (MP3/WAV)
+- [x] Export výsledného tracku (MP3/WAV)
 - [ ] Ukládání historie, smyček a playlistu (SQLite/JSON)
-- [ ] Podpora více skladeb, přehrávač
+- [x] Podpora více skladeb, přehrávač
 - [ ] Lokalizace CZ/EN (volitelné)
-- [ ] Kompletní testování aplikace (beta)
+- [x] Kompletní testování aplikace (beta)
 
 ---
 
 ### ✅ Prosinec
 - [ ] Vytvoření instalačního balíčku (PyInstaller)
 - [ ] Záloha projektu + export na USB
-- [ ] Napsání technické a uživatelské dokumentace
+- [x] Napsání technické a uživatelské dokumentace
 - [ ] Příprava prezentace a demo videa
 - [ ] Rezervní čas na doladění, chyby
 
