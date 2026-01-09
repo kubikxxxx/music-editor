@@ -301,8 +301,12 @@ class MainWindow(QMainWindow):
 
         # --- THEME state ---
         self._theme = self._load_theme_or_default()
+        self.accent_timer = QTimer(self)  # přidej do __init__
+        self.accent_timer.timeout.connect(self.updatedynamicaccent)
         self._apply_theme(self._theme)
         self._install_theme_menu()
+        self.time_counter = 0.0
+        self.dynamic_mode = False
 
         self.refresh_list(show_locations=True)
         self.repair_if_needed()
@@ -2081,19 +2085,32 @@ class MainWindow(QMainWindow):
             self._apply_theme(self._theme)
             self._save_theme()
 
-        m.addAction(QAction("Accent: Gold", self, triggered=lambda: set_accent("#D4AF37")))
-        m.addAction(QAction("Accent: Red", self, triggered=lambda: set_accent("#FF2A2A")))
-        m.addAction(QAction("Accent: Purple", self, triggered=lambda: set_accent("#8A2BE2")))
-        m.addAction(QAction("Accent: Blue", self, triggered=lambda: set_accent("#0575E5")))
+        def set_dynamic_accent(self):
+            """Dynamický akcent - mění se v QTimeru"""
+            import colorsys, math
+            self._theme.accent = QColor.fromRgbF(
+                0.5 + 0.5 * math.sin(self.time_counter * 2),  # R pulzuje rychle
+                0.3 + 0.4 * math.cos(self.time_counter * 1.5),  # G pomaleji
+                0.7 + 0.3 * math.sin(self.time_counter * 3),  # B chaos
+                1.0
+            )
+            self.time_counter += 0.01
+            self.apply_theme(self._theme)
 
-        def pick_custom():
-            col = QColorDialog.getColor(self._theme.accent, self, "Vyber accent barvu")
-            if col.isValid():
-                self._theme.accent = col
-                self._apply_theme(self._theme)
-                self._save_theme()
+        m.addAction(QAction("Accent Gold", self, triggered=lambda: self.setaccent("#D4AF37")))
+        m.addAction(QAction("Accent Red", self, triggered=lambda: self.setaccent("#FF2A2A")))
+        m.addAction(QAction("Accent Purple", self, triggered=lambda: self.setaccent("#8A2BE2")))
+        m.addAction(QAction("Accent Blue", self, triggered=lambda: self.setaccent("#0575E5")))
 
-        m.addAction(QAction("Accent: Vlastní…", self, triggered=pick_custom))
+
+
+        m.addAction(QAction("Accent Vlastní", self, triggered=self.pickcustom))
+
+
+        # Dynamic na konci
+        self.act_dynamic = QAction("Dynamic RGB", self, checkable=True)
+        self.act_dynamic.triggered.connect(self.toggle_dynamic_accent)
+        m.addAction(self.act_dynamic)
 
     def _install_export_menu(self) -> None:
         mb = self.menuBar()
@@ -2172,3 +2189,72 @@ class MainWindow(QMainWindow):
                 "Zkontroluj, že máš FFmpeg v PATH (pro MP3/FLAC).\n\n"
                 f"Chyba: {e}"
             )
+
+    def toggle_dynamic_accent(self):
+        self.dynamic_mode = not self.dynamic_mode
+        print(f"DYNAMIC Toggle -> {self.dynamic_mode}")
+
+        if self.dynamic_mode:
+            self.time_counter = 0.0
+            if not self.accent_timer.isActive():
+                self.accent_timer.start(50)
+                print("DYNAMIC Timer started!")
+        else:
+            if self.accent_timer.isActive():
+                self.accent_timer.stop()
+                print("DYNAMIC Timer stopped!")
+
+    def updatedynamicaccent(self):
+        import math
+
+        # inkrement času, ne reset
+        self.time_counter += 0.1
+
+        hue = math.sin(self.time_counter)  # whatever, to je ti asi jedno
+
+        r = max(0.2, min(1.0, 0.5 + 0.5 * math.sin(self.time_counter * 3)))
+        g = max(0.2, min(1.0, 0.5 + 0.5 * math.cos(self.time_counter * 2)))
+        b = max(0.2, min(1.0, 0.7 + 0.3 * math.sin(self.time_counter)))
+
+        newcolor = QColor.fromRgbF(r, g, b, 1.0)
+        self._theme.accent = newcolor
+
+        # Tohle je klíčové – znovu aplikovat theme
+        self._apply_theme(self._theme)
+
+        # Volitelně repolish některé widgety, pokud applytheme nedělá global stylesheet:
+        for w in (
+        self.practice_btn, self.playpause_btn, self.delete_btn, self.tempo_slider, self.timeline, self.list_widget):
+            try:
+                w.style().unpolish(w)
+                w.style().polish(w)
+                w.update()
+            except Exception:
+                pass
+
+    def setaccent(self, color_or_hex, dynamic=False):
+        """Nastaví accent a vypne dynamic mode."""
+        if isinstance(color_or_hex, str):
+            self._theme.accent = QColor(color_or_hex)
+        else:
+            self._theme.accent = color_or_hex
+
+        # VŽDY vypni dynamic při ručním nastavení
+        self.dynamic_mode = False
+        if self.accent_timer.isActive():
+            self.accent_timer.stop()
+            print("DYNAMIC Auto-stopped by manual accent!")
+
+        # Sync checkbox (pokud existuje)
+        try:
+            self.act_dynamic.setChecked(False)
+        except AttributeError:
+            pass
+
+        self._apply_theme(self._theme)
+        print(f"Accent set to {self._theme.accent.name()} (dynamic={dynamic})")
+    # Vlastní...
+    def pickcustom(self):
+        col = QColorDialog.getColor(self._theme.accent, self, "Vyber accent barvu")
+        if col.isValid():
+            self.setaccent(col)
