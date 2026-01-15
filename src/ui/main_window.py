@@ -2219,6 +2219,7 @@ class MainWindow(QMainWindow):
         newcolor = QColor.fromRgbF(r, g, b, 1.0)
         self._theme.accent = newcolor
 
+
         # Tohle je klíčové – znovu aplikovat theme
         self._apply_theme(self._theme)
 
