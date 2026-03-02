@@ -7,7 +7,7 @@ import random
 import sys
 import time
 from dataclasses import dataclass
-from ui.widgets.track_list import TrackListWidget
+# from ui.widgets.track_list import TrackListWidget
 from datetime import datetime
 from typing import Optional, Tuple, List
 from ml.infer import DanceAI
@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QFileDialog,
     QListWidgetItem, QMessageBox, QSplitter, QLineEdit, QSlider, QMenu,
     QSizePolicy, QCheckBox, QInputDialog, QDialog, QDialogButtonBox,
-    QColorDialog, QApplication
+    QColorDialog, QApplication, QTreeWidget, QTreeWidgetItem,
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QPoint, QRegularExpression,
@@ -134,11 +134,36 @@ class MainWindow(QMainWindow):
         self.tempo_slider.setValue(100)
         self.tempo_slider.setFixedHeight(20)
 
+        # --- Library UI: folders (left) + tracks (right) ---
+        # --- knihovna (folders + tracks) ---
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Hledat v knihovně…")
-        self.list_widget = TrackListWidget(self)
-        self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.list_widget.customContextMenuRequested.connect(self._show_list_context_menu)
+        self.search_edit.setPlaceholderText("Hledat (aktuální složka)…")
+
+        self.folder_tree = QTreeWidget(self)
+        self.folder_tree.setHeaderHidden(True)
+        self.folder_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.folder_tree.customContextMenuRequested.connect(self._show_folder_context_menu)
+        self.folder_tree.itemClicked.connect(self._on_folder_selected)
+
+        self.track_list = QTreeWidget(self)
+        self.track_list.setColumnCount(3)
+        self.track_list.setHeaderLabels(["★", "Název", "Délka"])
+        self.track_list.setRootIsDecorated(False)
+        self.track_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.track_list.customContextMenuRequested.connect(self._show_track_context_menu)
+        self.track_list.itemDoubleClicked.connect(self._on_track_double_clicked)
+        self.track_list.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
+
+        # filtr oblíbených
+        self.fav_filter_chk = QCheckBox("Jen oblíbené ★")
+        self.fav_filter_chk.stateChanged.connect(self._toggle_favorites_filter)
+
+        # stav knihovny
+        self._current_folder = ""  # relativně v LIB_DIR, "" = root
+        self._folder_item_by_rel: dict[str, QTreeWidgetItem] = {}
+
+        # search filtruje seznam tracků
+        self.search_edit.textChanged.connect(lambda *_: self.refresh_track_list())
 
         self.import_btn = QPushButton("Import…")
         self.delete_btn = QPushButton("Smazat")
@@ -162,7 +187,14 @@ class MainWindow(QMainWindow):
         left.setContentsMargins(8, 8, 8, 8)
         left.setSpacing(6)
         left.addWidget(self.search_edit)
-        left.addWidget(self.list_widget)
+
+        # splitter uvnitř levého panelu: folder tree + track list
+        lib_split = QSplitter(Qt.Orientation.Vertical)
+        lib_split.addWidget(self.folder_tree)
+        lib_split.addWidget(self.track_list)
+        lib_split.setStretchFactor(0, 2)
+        lib_split.setStretchFactor(1, 5)
+        left.addWidget(lib_split)
         rowL = QHBoxLayout()
         rowL.setSpacing(6)
         for b in (self.import_btn, self.delete_btn, self.repair_btn, self.relink_btn, self.fav_filter_chk):
@@ -256,8 +288,8 @@ class MainWindow(QMainWindow):
         self.delete_btn.clicked.connect(self.delete_selected)
         self.repair_btn.clicked.connect(self._do_bulk_repair)
         self.relink_btn.clicked.connect(self._do_bulk_relink)
-        self.list_widget.itemDoubleClicked.connect(self.play_selected)
-        self.search_edit.textChanged.connect(lambda *_: self.refresh_list(show_locations=False))
+        # self.list_widget.itemDoubleClicked.connect(self.play_selected)
+        # self.search_edit.textChanged.connect(lambda *_: self.refresh_list(show_locations=False))
 
         self._install_shortcuts()
 
@@ -308,7 +340,8 @@ class MainWindow(QMainWindow):
         self.time_counter = 0.0
         self.dynamic_mode = False
 
-        self.refresh_list(show_locations=True)
+        # self.refresh_list(show_locations=True)
+        self.refresh_folder_tree(select_folder="")
         self.repair_if_needed()
         self._ai = DanceAI()
         self._install_export_menu()
@@ -508,7 +541,7 @@ class MainWindow(QMainWindow):
             self.practice_btn, self.playpause_btn, self.delete_btn,
             self.open_btn, self.prev_btn, self.stop_btn, self.next_btn,
             self.import_btn, self.repair_btn, self.relink_btn,
-            self.search_edit, self.list_widget, self.timeline, self.track_editor
+            self.search_edit, self.folder_tree, self.track_list, self.timeline, self.track_editor
         ):
             try:
                 w.style().unpolish(w)
@@ -573,36 +606,7 @@ class MainWindow(QMainWindow):
 
     def _toggle_favorites_filter(self, *_):
         self._favorites_only = self.fav_filter_chk.isChecked()
-        self.refresh_list(show_locations=False)
-
-    def _show_list_context_menu(self, pos: QPoint):
-        item = self.list_widget.itemAt(pos)
-        menu = QMenu(self)
-        if item:
-            track_id = item.data(Qt.ItemDataRole.UserRole)
-            fav_now = self._is_favorite(track_id)
-            act_fav = menu.addAction("Odebrat z oblíbených ★" if fav_now else "Označit jako oblíbené ★")
-            menu.addSeparator()
-            act_play = menu.addAction("Přehrát")
-            # --- NOVÉ: AI rozpoznání ---
-            act_ai = menu.addAction("Rozpoznat taneční styl (AI)…")
-
-            chosen = menu.exec(self.list_widget.mapToGlobal(pos))
-            if not chosen:
-                return
-            if chosen == act_fav:
-                self._set_favorite(track_id, not fav_now)
-                self.refresh_list(show_locations=False)
-            elif chosen == act_play:
-                self._play_track_id(track_id)
-                self._start_playback()
-            elif chosen == act_ai:
-                self._recognize_style_for_track_id(track_id)  # << nová metoda níže
-        else:
-            act_reload = menu.addAction("Obnovit seznam")
-            chosen = menu.exec(self.list_widget.mapToGlobal(pos))
-            if chosen == act_reload:
-                self.refresh_list(show_locations=False)
+        self.refresh_track_list()
 
     def _recognize_style_for_track_id(self, track_id: str):
         path = self.library.get_track_path(track_id)
@@ -1099,73 +1103,403 @@ class MainWindow(QMainWindow):
             self.track_editor.setWaveform(None, self._original_duration_ms or 0)
 
     # ---------- knihovna + filtr ----------
-    def refresh_list(self, show_locations: bool = False):
-        query = (self.search_edit.text() or "").strip().lower()
-        self.list_widget.clear()
-        self._filtered_ids = []
-        try:
-            tracks = self.library.list_tracks()
-            for t in tracks:
-                title = t.title or ""
-                if query and query not in title.lower():
-                    continue
-                tid = t.id
-                if self._favorites_only and not self._is_favorite(tid):
-                    continue
-                star = " ★" if self._is_favorite(tid) else ""
-                item = QListWidgetItem(f"{title}{star}  ({(t.duration_ms or 0)//1000}s)")
-                item.setData(Qt.ItemDataRole.UserRole, tid)
-                self.list_widget.addItem(item)
-                self._filtered_ids.append(tid)
-        except Exception as e:
-            QMessageBox.warning(self, "Library error", str(e))
+    def _library_root_dir(self) -> str:
+        lib_dir, _ = self.library.locations()
+        return lib_dir or ""
+
+    def _folder_rel_from_item(self, item: QTreeWidgetItem) -> str:
+        rel = item.data(0, Qt.ItemDataRole.UserRole)
+        return (rel or "").replace("\\", "/")
+
+    def refresh_folder_tree(self, select_folder: str = "", show_locations: bool = False):
+        """
+        Strom složek čte přímo ze filesystemu .pmdata/library/**,
+        takže složky mohou existovat i prázdné.
+        """
+        lib_dir = self._library_root_dir()
+        self.folder_tree.clear()
+        self._folder_item_by_rel = {}
+
+        root_item = QTreeWidgetItem(self.folder_tree, ["Knihovna"])
+        root_item.setData(0, Qt.ItemDataRole.UserRole, "")
+        root_item.setExpanded(True)
+        self._folder_item_by_rel[""] = root_item
+
+        if lib_dir and os.path.isdir(lib_dir):
+            for cur_root, dirs, _files in os.walk(lib_dir):
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+
+                rel = os.path.relpath(cur_root, lib_dir).replace("\\", "/")
+                rel = "" if rel == "." else rel
+
+                # ensure item exists
+                if rel != "" and rel not in self._folder_item_by_rel:
+                    parent_rel = os.path.dirname(rel).replace("\\", "/")
+                    name = os.path.basename(rel)
+                    parent_item = self._folder_item_by_rel.get(parent_rel, root_item)
+
+                    it = QTreeWidgetItem(parent_item, [name])
+                    it.setData(0, Qt.ItemDataRole.UserRole, rel)
+                    it.setExpanded(True)
+                    self._folder_item_by_rel[rel] = it
+
+                # create child items for dirs (so they exist even if empty)
+                for d in dirs:
+                    child_rel = f"{rel}/{d}".strip("/") if rel else d
+                    if child_rel not in self._folder_item_by_rel:
+                        parent_item = self._folder_item_by_rel.get(rel, root_item)
+                        it = QTreeWidgetItem(parent_item, [d])
+                        it.setData(0, Qt.ItemDataRole.UserRole, child_rel)
+                        it.setExpanded(True)
+                        self._folder_item_by_rel[child_rel] = it
+
+        # select
+        sel = (select_folder or "").replace("\\", "/").strip("/")
+        sel_item = self._folder_item_by_rel.get(sel, root_item)
+        self.folder_tree.setCurrentItem(sel_item)
+        self._current_folder = self._folder_rel_from_item(sel_item)
+
+        # refresh tracks for folder
+        self.refresh_track_list()
+
         if show_locations:
-            lib_dir, db_path = self.library.locations()
+            _, db_path = self.library.locations()
             self.info_label.setText(f"Knihovna: {lib_dir}\nDB: {db_path}")
 
-    def _index_in_filter(self, track_id: str | None) -> int:
-        if not track_id:
-            return -1
+    def _on_folder_selected(self, item: QTreeWidgetItem, _col: int):
+        self._current_folder = self._folder_rel_from_item(item)
+        self.refresh_track_list()
+
+    def refresh_track_list(self):
+        """
+        Naplní pravý seznam tracků pro aktuálně vybranou složku.
+        Respektuje favorites-only a search.
+        Nastaví _filtered_ids pro next/prev.
+        """
+        folder = (self._current_folder or "").replace("\\", "/").strip("/")
+        query = (self.search_edit.text() or "").strip().lower()
+
+        self.track_list.clear()
+        self._filtered_ids = []
+
         try:
-            return self._filtered_ids.index(track_id)
-        except ValueError:
-            return -1
+            rows = self.library.list_tracks_raw()  # (id, title, path, rel_path, duration_ms)
+            for tid, title, _path, rel_path, dur_ms in rows:
+                tid = str(tid)
+                title = (title or "").strip()
+                rel_path = (rel_path or "").replace("\\", "/")
+                track_folder = os.path.dirname(rel_path).replace("\\", "/").strip("/")
 
-    def play_next_in_filter(self, *, force_play: bool = False):
-        if not self._filtered_ids:
+                # jen aktuální složka
+                if folder:
+                    if not (track_folder == folder or track_folder.startswith(folder + "/")):
+                        continue
+
+                if self._favorites_only and not self._is_favorite(tid):
+                    continue
+
+                if query and query not in title.lower():
+                    continue
+
+                star = "★" if self._is_favorite(tid) else ""
+                dur_txt = fmt_ms(int(dur_ms or 0))
+
+                it = QTreeWidgetItem([star, title, dur_txt])
+                it.setData(0, Qt.ItemDataRole.UserRole, tid)
+                self.track_list.addTopLevelItem(it)
+
+                self._filtered_ids.append(tid)
+
+        except Exception as e:
+            QMessageBox.warning(self, "Library error", str(e))
+
+        try:
+            self.track_list.resizeColumnToContents(0)
+            self.track_list.resizeColumnToContents(2)
+        except Exception:
+            pass
+
+    def _on_track_double_clicked(self, item: QTreeWidgetItem, _col: int):
+        track_id = item.data(0, Qt.ItemDataRole.UserRole)
+        if not track_id:
             return
-        idx = self._index_in_filter(self._current_track_id)
-        next_idx = 0 if idx < 0 or idx + 1 >= len(self._filtered_ids) else idx + 1
-        self._play_track_id(self._filtered_ids[next_idx])
+        self._play_track_id(str(track_id))
+        self._start_playback()
 
-        # pokud už něco hrálo, pokračuj plynule; případně vynuceně (autoplay)
-        if force_play or self._transport_playing:
+    def _show_folder_context_menu(self, pos: QPoint):
+        item = self.folder_tree.itemAt(pos)
+        if not item:
+            return
+        rel = self._folder_rel_from_item(item)
+        lib_dir = self._library_root_dir()
+
+        menu = QMenu(self)
+        act_new = menu.addAction("Nová složka…")
+        act_ren = menu.addAction("Přejmenovat…")
+        act_del = menu.addAction("Smazat složku…")
+
+        chosen = menu.exec(self.folder_tree.mapToGlobal(pos))
+        if not chosen:
+            return
+
+        def abs_path(r: str) -> str:
+            r = (r or "").replace("\\", "/").strip("/")
+            return os.path.join(lib_dir, r) if r else lib_dir
+
+        if chosen == act_new:
+            name, ok = QInputDialog.getText(self, "Nová složka", "Název složky:")
+            if not ok or not name.strip():
+                return
+            name = name.strip().replace("\\", "/").strip("/")
+            new_rel = f"{rel}/{name}".strip("/") if rel else name
+            os.makedirs(abs_path(new_rel), exist_ok=True)
+            self.refresh_folder_tree(select_folder=new_rel)
+            return
+
+        if chosen == act_ren:
+            if rel == "":
+                QMessageBox.information(self, "Knihovna", "Kořen nelze přejmenovat.")
+                return
+            old_name = os.path.basename(rel)
+            name, ok = QInputDialog.getText(self, "Přejmenovat složku", "Nový název:", text=old_name)
+            if not ok or not name.strip():
+                return
+            name = name.strip().replace("\\", "/").strip("/")
+            parent_rel = os.path.dirname(rel).replace("\\", "/").strip("/")
+            new_rel = f"{parent_rel}/{name}".strip("/") if parent_rel else name
+
+            try:
+                os.rename(abs_path(rel), abs_path(new_rel))
+            except Exception as e:
+                QMessageBox.critical(self, "Přejmenovat", str(e))
+                return
+
+            # update DB rel_path a path pro tracky v přejmenované složce
+            try:
+                old_prefix = rel.strip("/") + "/"
+                new_prefix = new_rel.strip("/") + "/"
+                self.library.conn.execute(
+                    "UPDATE tracks SET rel_path = REPLACE(rel_path, ?, ?) WHERE rel_path LIKE ?",
+                    (old_prefix, new_prefix, old_prefix + "%")
+                )
+                rows = self.library.conn.execute("SELECT id, rel_path FROM tracks").fetchall()
+                for tid, rp in rows:
+                    rp = (rp or "").replace("\\", "/")
+                    if rp:
+                        self.library.conn.execute(
+                            "UPDATE tracks SET path=? WHERE id=?",
+                            (os.path.join(lib_dir, rp.replace("/", os.sep)), tid)
+                        )
+                self.library.conn.commit()
+            except Exception:
+                pass
+
+            self.refresh_folder_tree(select_folder=new_rel)
+            return
+
+        if chosen == act_del:
+            if rel == "":
+                QMessageBox.information(self, "Knihovna", "Kořen nelze smazat.")
+                return
+
+            # zjisti tracky v této složce (přes rel_path prefix)
+            rows = self.library.list_tracks_raw()
+            prefix = rel.strip("/") + "/"
+            in_folder = [str(tid) for tid, _t, _p, rp, _d in rows
+                         if (rp or "").replace("\\", "/").startswith(prefix) or
+                         os.path.dirname((rp or "").replace("\\", "/")).strip("/") == rel.strip("/")]
+
+            if in_folder:
+                msg = QMessageBox(self)
+                msg.setIcon(QMessageBox.Icon.Question)
+                msg.setWindowTitle("Smazat složku")
+                msg.setText("Složka obsahuje skladby. Co s nimi?")
+                btn_del_all = msg.addButton("Smazat i skladby", QMessageBox.ButtonRole.AcceptRole)
+                btn_move_root = msg.addButton("Přesunout skladby do root", QMessageBox.ButtonRole.DestructiveRole)
+                btn_cancel = msg.addButton("Zrušit", QMessageBox.ButtonRole.RejectRole)
+                msg.exec()
+
+                clicked = msg.clickedButton()
+                if clicked == btn_cancel:
+                    return
+
+                if clicked == btn_move_root:
+                    for tid in in_folder:
+                        try:
+                            self.library.move_track(tid, "")
+                        except Exception:
+                            pass
+
+                if clicked == btn_del_all:
+                    for tid in in_folder:
+                        try:
+                            self.library.remove(tid, delete_file=True)
+                            self._set_favorite(tid, False)
+                        except Exception:
+                            pass
+
+            try:
+                shutil.rmtree(abs_path(rel), ignore_errors=True)
+            except Exception:
+                pass
+
+            self.refresh_folder_tree(select_folder="")
+            return
+
+    def _show_track_context_menu(self, pos: QPoint):
+        item = self.track_list.itemAt(pos)
+        menu = QMenu(self)
+
+        if not item:
+            act_reload = menu.addAction("Obnovit")
+            chosen = menu.exec(self.track_list.mapToGlobal(pos))
+            if chosen == act_reload:
+                self.refresh_track_list()
+            return
+
+        # když pravým klikem kliknu na item, který není ve výběru,
+        # tak výběr přepni jen na něj (chování jako Explorer)
+        if item not in self.track_list.selectedItems():
+            self.track_list.setCurrentItem(item)
+            item.setSelected(True)
+
+        # seber všechny vybrané tracky
+        selected_items = self.track_list.selectedItems()
+        track_ids = []
+        for it in selected_items:
+            tid = it.data(0, Qt.ItemDataRole.UserRole)
+            if tid:
+                track_ids.append(str(tid))
+
+        if not track_ids:
+            return
+
+        # pro menu používej "první" track jako referenci (např. pro favorite state text)
+        first_id = track_ids[0]
+        fav_now = self._is_favorite(first_id)
+
+        act_play = menu.addAction("Přehrát")
+        act_fav = menu.addAction("Odebrat z oblíbených ★" if fav_now else "Označit jako oblíbené ★")
+        act_ai = menu.addAction("Rozpoznat taneční styl (AI)…")
+        menu.addSeparator()
+        act_move = menu.addAction(f"Přesunout do složky… ({len(track_ids)})")
+        act_del = menu.addAction(f"Smazat ({len(track_ids)})")
+
+        chosen = menu.exec(self.track_list.mapToGlobal(pos))
+        if not chosen:
+            return
+
+        if chosen == act_play:
+            # přehrát první vybraný
+            self._play_track_id(first_id)
             self._start_playback()
-
-    def play_previous_in_filter(self, *, force_play: bool = False):
-        if not self._filtered_ids:
             return
-        # při pauznutém „replay“ chování ponecháme návrat na začátek
-        if not force_play and not self._transport_playing and self._arr_time_ms > 10_000:
-            self.on_seek_requested(0)
-            return
-        idx = self._index_in_filter(self._current_track_id)
-        prev_idx = len(self._filtered_ids) - 1 if idx <= 0 else idx - 1
-        self._play_track_id(self._filtered_ids[prev_idx])
-        if force_play or self._transport_playing:
-            self._start_playback()
 
-    # ---------- integrita ----------
+        if chosen == act_fav:
+            # nastav oblíbené pro všechny vybrané na stejnou hodnotu
+            new_val = not fav_now
+            for tid in track_ids:
+                self._set_favorite(tid, new_val)
+            self.refresh_track_list()
+            return
+
+        if chosen == act_ai:
+            # AI jen pro první vybraný (můžeš rozšířit na batch později)
+            self._recognize_style_for_track_id(first_id)
+            return
+
+        if chosen == act_move:
+            new_folder, ok = QInputDialog.getText(
+                self, "Přesunout",
+                "Nová složka (např. LAT/samba):",
+                text=self._current_folder or ""
+            )
+            if not ok:
+                return
+            new_folder = (new_folder or "").replace("\\", "/").strip("/")
+
+            try:
+                lib_dir = self._library_root_dir()
+                os.makedirs(os.path.join(lib_dir, new_folder), exist_ok=True)
+
+                moved = 0
+                for tid in track_ids:
+                    if self.library.move_track(tid, new_folder):
+                        moved += 1
+
+            except Exception as e:
+                QMessageBox.critical(self, "Přesun", str(e))
+                return
+
+            self.refresh_folder_tree(select_folder=new_folder)
+            if moved:
+                QMessageBox.information(self, "Přesunuto", f"Přesunuto {moved} položek do:\n{new_folder}")
+            return
+
+        if chosen == act_del:
+            if QMessageBox.question(
+                    self, "Smazat",
+                    f"Opravdu smazat {len(track_ids)} skladeb z knihovny (včetně souborů)?"
+            ) == QMessageBox.StandardButton.Yes:
+                for tid in track_ids:
+                    try:
+                        self.library.remove(tid, delete_file=True)
+                        self._set_favorite(tid, False)
+                    except Exception:
+                        pass
+                self.refresh_track_list()
+            return
+
+    def import_tracks(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Import audio do knihovny", "", "Audio (*.mp3 *.wav *.flac)")
+        if not paths:
+            return
+        subdir = (self._current_folder or "").replace("\\", "/").strip("/")
+        for p in paths:
+            try:
+                self.library.add_file(p, subdir=subdir)
+            except Exception as e:
+                QMessageBox.warning(self, "Import", f"{os.path.basename(p)}: {e}")
+        self.refresh_folder_tree(select_folder=subdir)
+
+    def delete_selected(self):
+        items = self.track_list.selectedItems()
+        if not items:
+            return
+        ids = []
+        for it in items:
+            tid = it.data(0, Qt.ItemDataRole.UserRole)
+            if tid:
+                ids.append(str(tid))
+        if not ids:
+            return
+
+        if QMessageBox.question(
+                self, "Smazat",
+                f"Opravdu smazat {len(ids)} skladby z knihovny (včetně souborů)?"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        for tid in ids:
+            try:
+                self.library.remove(tid, delete_file=True)
+                self._set_favorite(tid, False)
+            except Exception:
+                pass
+
+        self.refresh_folder_tree(select_folder=self._current_folder or "")
+
     def repair_if_needed(self):
         checked, removed = self.library.verify_integrity()
         if removed:
             QMessageBox.information(self, "Knihovna opravena",
                                     f"Odstraněno {removed} neplatných záznamů z {checked}.")
-            self.refresh_list()
+        # vždy refresh
+        self.refresh_folder_tree(select_folder=self._current_folder or "")
 
     def _do_bulk_repair(self):
         checked, removed = self.library.bulk_repair()
-        self.refresh_list()
+        self.refresh_folder_tree(select_folder=self._current_folder or "")
         QMessageBox.information(self, "Hromadná oprava",
                                 f"Zkontrolováno: {checked}\nOdstraněno chybějících: {removed}")
 
@@ -1174,37 +1508,11 @@ class MainWindow(QMainWindow):
         if not folder:
             return
         missing, relinked = self.library.relink_missing_by_basename(folder)
-        self.refresh_list()
+        self.refresh_folder_tree(select_folder=self._current_folder or "")
         QMessageBox.information(self, "Relink dokončen",
                                 f"Nalezeno chybějících v DB: {missing}\n"
                                 f"Úspěšně přelinkováno: {relinked}")
 
-    # ---------- akce na knihovně ----------
-    def import_tracks(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Import audio do knihovny", "", "Audio (*.mp3 *.wav *.flac)")
-        if not paths:
-            return
-        for p in paths:
-            try:
-                self.library.add_file(p)
-            except Exception as e:
-                QMessageBox.warning(self, "Import error", f"{os.path.basename(p)}: {e}")
-        self.refresh_list()
-
-    def delete_selected(self):
-        item = self.list_widget.currentItem()
-        if not item:
-            return
-        track_id = item.data(Qt.ItemDataRole.UserRole)
-        if QMessageBox.question(self, "Smazat",
-                                "Opravdu smazat vybranou skladbu z knihovny (včetně souboru)?"
-                                ) == QMessageBox.StandardButton.Yes:
-            try:
-                self.library.remove(track_id)
-                self._set_favorite(track_id, False)
-                self.refresh_list()
-            except Exception as e:
-                QMessageBox.critical(self, "Delete error", str(e))
 
     # ---------- přehrávání ----------
     def _play_track_id(self, track_id: str):
@@ -1222,11 +1530,14 @@ class MainWindow(QMainWindow):
         self._gain_regions = []
         self._load_and_play_original(path)
 
-        for i in range(self.list_widget.count()):
-            it = self.list_widget.item(i)
-            if it.data(Qt.ItemDataRole.UserRole) == track_id:
-                self.list_widget.setCurrentItem(it)
-                break
+        try:
+            for i in range(self.track_list.topLevelItemCount()):
+                it = self.track_list.topLevelItem(i)
+                if it.data(0, Qt.ItemDataRole.UserRole) == track_id:
+                    self.track_list.setCurrentItem(it)
+                    break
+        except Exception:
+            pass
 
     def _get_tempo_variant(self, src_path: str, tempo: float) -> str:
         """Vrátí cestu k WAV s upraveným tempem (cache podle src+tempo)."""
@@ -1246,13 +1557,34 @@ class MainWindow(QMainWindow):
         self._tempo_tmp_paths.add(out_path)
         return out_path
 
-    def play_selected(self):
-        item = self.list_widget.currentItem()
-        if not item:
+    def _index_in_filter(self, track_id: str | None) -> int:
+        if not track_id:
+            return -1
+        try:
+            return self._filtered_ids.index(track_id)
+        except ValueError:
+            return -1
+
+    def play_next_in_filter(self, *, force_play: bool = False):
+        if not self._filtered_ids:
             return
-        track_id = item.data(Qt.ItemDataRole.UserRole)
-        self._play_track_id(track_id)
-        self._start_playback()
+        idx = self._index_in_filter(self._current_track_id)
+        next_idx = 0 if idx < 0 or idx + 1 >= len(self._filtered_ids) else idx + 1
+        self._play_track_id(self._filtered_ids[next_idx])
+        if force_play or self._transport_playing:
+            self._start_playback()
+
+    def play_previous_in_filter(self, *, force_play: bool = False):
+        if not self._filtered_ids:
+            return
+        if not force_play and not self._transport_playing and self._arr_time_ms > 10_000:
+            self.on_seek_requested(0)
+            return
+        idx = self._index_in_filter(self._current_track_id)
+        prev_idx = len(self._filtered_ids) - 1 if idx <= 0 else idx - 1
+        self._play_track_id(self._filtered_ids[prev_idx])
+        if force_play or self._transport_playing:
+            self._start_playback()
 
     def _load_and_play_original(self, path: str):
         self._cleanup_tempo_tmp()
@@ -1634,7 +1966,7 @@ class MainWindow(QMainWindow):
                 return
 
             try:
-                self.refresh_list(show_locations=False)
+                self.refresh_folder_tree(select_folder=self._current_folder or "")
                 target_title = os.path.splitext(base_name)[0].lower()
                 track_id = None
                 for t in self.library.list_tracks():
@@ -2225,7 +2557,7 @@ class MainWindow(QMainWindow):
 
         # Volitelně repolish některé widgety, pokud applytheme nedělá global stylesheet:
         for w in (
-        self.practice_btn, self.playpause_btn, self.delete_btn, self.tempo_slider, self.timeline, self.list_widget):
+        self.practice_btn, self.playpause_btn, self.delete_btn, self.tempo_slider, self.timeline, self.folder_tree, self.track_list):
             try:
                 w.style().unpolish(w)
                 w.style().polish(w)
